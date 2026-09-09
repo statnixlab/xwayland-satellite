@@ -24,6 +24,7 @@ pub trait XConnection: Sized + 'static {
         self.set_fullscreen(window, fullscreen);
     }
     fn focus_window(&mut self, window: x::Window, output_name: Option<String>);
+    fn send_take_focus(&mut self, window: x::Window);
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
     fn raise_to_top(&mut self, window: x::Window);
