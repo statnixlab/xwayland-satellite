@@ -1668,6 +1668,54 @@ fn raise_window_on_pointer_event() {
 }
 
 #[test]
+fn hidpi_cursor_protocol_keeps_windows_unscaled() {
+    let expected: i32 = std::env::var("XWS_CURSOR_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let (_, cursor) = comp.create_surface();
+    f.run();
+    let cursor_id = f.testwl.last_created_surface_id().unwrap();
+    pointer
+        .send_request(Req::<WlPointer>::SetCursor {
+            serial: 0,
+            surface: Some(cursor.obj.clone()),
+            hotspot_x: 10,
+            hotspot_y: 14,
+        })
+        .unwrap();
+    f.run();
+    let data = f.testwl.get_surface_data(cursor_id).unwrap();
+    assert_eq!(data.buffer_scale, expected);
+    assert_eq!(data.cursor_hotspot, Some((10 / expected, 14 / expected)));
+
+    // Xwayland may resend scale=1 on every pointer-enter or shape change.
+    cursor
+        .send_request(Req::<WlSurface>::SetBufferScale { scale: 1 })
+        .unwrap();
+    cursor.send_request(Req::<WlSurface>::Commit {}).unwrap();
+    f.run();
+    assert_eq!(
+        f.testwl.get_surface_data(cursor_id).unwrap().buffer_scale,
+        expected
+    );
+
+    let (_, window) = comp.create_surface();
+    window
+        .send_request(Req::<WlSurface>::SetBufferScale { scale: 1 })
+        .unwrap();
+    f.run();
+    let window_id = f.testwl.last_created_surface_id().unwrap();
+    assert_eq!(
+        f.testwl.get_surface_data(window_id).unwrap().buffer_scale,
+        1
+    );
+}
+
+#[test]
 fn override_redirect_choose_hover_window() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});

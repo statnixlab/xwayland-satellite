@@ -108,6 +108,8 @@ pub struct Viewport {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SurfaceData {
     pub surface: WlSurface,
+    pub buffer_scale: i32,
+    pub cursor_hotspot: Option<(i32, i32)>,
     pub buffer: Option<WlBuffer>,
     pub last_damage: Option<BufferDamage>,
     pub role: Option<SurfaceRole>,
@@ -1451,9 +1453,15 @@ impl Dispatch<WlPointer, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         match request {
-            wl_pointer::Request::SetCursor { surface, .. } => {
+            wl_pointer::Request::SetCursor {
+                surface,
+                hotspot_x,
+                hotspot_y,
+                ..
+            } => {
                 if let Some(surface) = surface {
                     let data = state.surfaces.get_mut(&SurfaceId::from(&surface)).unwrap();
+                    data.cursor_hotspot = Some((hotspot_x, hotspot_y));
 
                     assert!(
                         matches!(
@@ -1961,6 +1969,8 @@ impl Dispatch<WlCompositor, ()> for State {
                     SurfaceId(id),
                     SurfaceData {
                         surface,
+                        buffer_scale: 1,
+                        cursor_hotspot: None,
                         buffer: None,
                         last_damage: None,
                         role: None,
@@ -2063,7 +2073,7 @@ impl Dispatch<WlSurface, ()> for State {
                 state.surfaces.remove(&id);
             }
             SetInputRegion { .. } => {}
-            SetBufferScale { .. } => {}
+            SetBufferScale { scale } => data.buffer_scale = scale,
             other => todo!("unhandled request {other:?}"),
         }
     }
