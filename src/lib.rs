@@ -56,6 +56,11 @@ pub trait RunData {
     fn max_req_len_bytes(&self) -> Option<usize> {
         None
     }
+    fn file_clipboard_executable(&self) -> Option<std::path::PathBuf> {
+        std::env::var_os("XWS_FILE_CLIPBOARD_EXE")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+    }
 }
 
 pub const fn timespec_from_millis(millis: u64) -> Timespec {
@@ -203,6 +208,7 @@ pub fn main(mut data: impl RunData) -> Option<()> {
     }
 
     let mut xstate = XState::new(xsock_wl.as_fd());
+    xstate.set_file_clipboard_executable(data.file_clipboard_executable());
     if let Some(bytes) = data.max_req_len_bytes() {
         xstate.set_max_req_bytes(bytes);
     }

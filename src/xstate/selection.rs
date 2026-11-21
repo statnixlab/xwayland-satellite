@@ -438,6 +438,7 @@ trait SelectionDataImpl {
         atoms: &super::Atoms,
         request: &x::SelectionRequestEvent,
         max_req_bytes: usize,
+        prefer_file_urls: bool,
         server_state: &mut RealServerState,
     ) -> SelectionRequestOutcome;
     fn atom(&self) -> x::Atom;
@@ -635,6 +636,7 @@ impl<T: SelectionType> SelectionDataImpl for SelectionData<T> {
         atoms: &super::Atoms,
         request: &x::SelectionRequestEvent,
         max_req_bytes: usize,
+        prefer_file_urls: bool,
         _server_state: &mut RealServerState,
     ) -> SelectionRequestOutcome {
         use SelectionRequestOutcome::{Immediate, Pending};
@@ -645,7 +647,14 @@ impl<T: SelectionType> SelectionDataImpl for SelectionData<T> {
             return Immediate(false);
         };
         if request.target() == atoms.targets {
-            let targets: Box<[x::Atom]> = mimes.iter().map(|t| t.target).collect();
+            // Only the configured client receives a file-only view. The
+            // underlying offer, bytes, clipboard owner and other clients are
+            // unchanged. X11 property size probes see the correct final size.
+            let targets: Box<[x::Atom]> = mimes
+                .iter()
+                .filter(|target| !prefer_file_urls || target.name == "text/uri-list")
+                .map(|target| target.target)
+                .collect();
             return Immediate(
                 connection
                     .send_and_check_request(&x::ChangeProperty {
@@ -717,6 +726,34 @@ impl SelectionState {
 }
 
 impl XState {
+    fn prefer_file_urls_for(&self, request: &x::SelectionRequestEvent) -> bool {
+        let Some(executable) = self.file_clipboard_executable.as_ref() else {
+            return false;
+        };
+        if request.selection() != self.atoms.clipboard || request.target() != self.atoms.targets {
+            return false;
+        }
+        let Some(CurrentSelection::Wayland(selection)) =
+            self.selection_state.clipboard.current_selection.as_ref()
+        else {
+            return false;
+        };
+        if !selection
+            .mimes
+            .iter()
+            .any(|target| target.name == "text/uri-list")
+            || !selection
+                .mimes
+                .iter()
+                .any(|target| target.name == "x-special/gnome-copied-files")
+        {
+            return false;
+        }
+        self.get_pid(request.requestor())
+            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
+            .is_some_and(|actual| actual == *executable)
+    }
+
     pub(crate) fn has_pending_selection_transfers(&self) -> bool {
         !self.selection_state.pending_reads.is_empty()
             || !self.selection_state.incr_data.is_empty()
@@ -989,6 +1026,7 @@ impl XState {
                 }
             }
             xcb::Event::X(x::Event::SelectionRequest(e)) => {
+                let prefer_file_urls = self.prefer_file_urls_for(e);
                 let data = get_selection_data!(e.selection());
                 let reply = SelectionReply::from_request(e);
                 if log::log_enabled!(log::Level::Debug) {
@@ -1008,6 +1046,7 @@ impl XState {
                     &self.atoms,
                     e,
                     self.max_req_bytes,
+                    prefer_file_urls,
                     server_state,
                 );
                 match outcome {

@@ -29,16 +29,22 @@ struct TestDataInner {
     server: Mutex<Option<UnixStream>>,
     pid: Mutex<Option<u32>>,
     quit_rx: Mutex<Option<UnixStream>>,
+    file_clipboard_executable: Option<std::path::PathBuf>,
 }
 
 #[derive(Default, Clone)]
 struct TestData(Arc<TestDataInner>);
 
 impl TestData {
-    fn new(server: UnixStream, quit_rx: UnixStream) -> Self {
+    fn new(
+        server: UnixStream,
+        quit_rx: UnixStream,
+        file_clipboard_executable: Option<std::path::PathBuf>,
+    ) -> Self {
         Self(Arc::new(TestDataInner {
             server: Mutex::new(server.into()),
             quit_rx: Mutex::new(Some(quit_rx)),
+            file_clipboard_executable,
             ..Default::default()
         }))
     }
@@ -86,6 +92,9 @@ impl xwls::RunData for TestData {
     fn max_req_len_bytes(&self) -> Option<usize> {
         Some(500)
     }
+    fn file_clipboard_executable(&self) -> Option<std::path::PathBuf> {
+        self.file_clipboard_executable.clone()
+    }
 }
 
 struct Fixture {
@@ -123,6 +132,13 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new_preset(pre_connect: impl FnOnce(&mut testwl::Server)) -> Self {
+        Self::new_with_file_compat(pre_connect, None)
+    }
+
+    fn new_with_file_compat(
+        pre_connect: impl FnOnce(&mut testwl::Server),
+        executable: Option<std::path::PathBuf>,
+    ) -> Self {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             pretty_env_logger::formatted_timed_builder()
@@ -138,7 +154,7 @@ impl Fixture {
         let mut testwl = testwl::Server::new(false);
         pre_connect(&mut testwl);
         testwl.connect(a);
-        let our_data = TestData::new(b, quit_rx);
+        let our_data = TestData::new(b, quit_rx, executable);
         let data = our_data.clone();
         let thread = std::thread::spawn(move || xwls::main(data));
 
@@ -2995,4 +3011,129 @@ fn primary_owner_destroy_does_not_clear_clipboard() {
         long_length: 20,
     });
     assert_eq!(reply.value::<u8>(), b"clipboard intact");
+}
+
+#[test]
+fn file_clipboard_view_is_scoped_and_does_not_stick() {
+    for executable in [
+        None,
+        Some(std::env::current_exe().unwrap()),
+        Some("/not-the-requestor".into()),
+    ] {
+        let limited = executable.as_ref() == Some(&std::env::current_exe().unwrap());
+        let mut f = Fixture::new_with_file_compat(|_| {}, executable);
+        let mut connection = Connection::new(&f.display);
+        let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+        connection.get_selection_owner_change_events(true, window);
+        f.map_as_toplevel(&mut connection, window);
+        let uri = "file:///tmp/clipboard-example.docx\r\n";
+        let file_offer = vec![
+            testwl::PasteData {
+                mime_type: "x-special/gnome-copied-files".into(),
+                data: format!("copy\n{uri}").into_bytes(),
+            },
+            testwl::PasteData {
+                mime_type: "text/plain;charset=utf-8".into(),
+                data: b"/tmp/clipboard-example.docx".to_vec(),
+            },
+            testwl::PasteData {
+                mime_type: "text/uri-list".into(),
+                data: uri.as_bytes().to_vec(),
+            },
+        ];
+        let text_offer = vec![testwl::PasteData {
+            mime_type: "text/plain".into(),
+            data: b"new text after copying a file".to_vec(),
+        }];
+        for (index, offer) in [file_offer, text_offer].into_iter().enumerate() {
+            f.testwl.create_data_offer(offer.clone());
+            connection.await_selection_owner_change();
+            connection.verify_clipboard_owner(connection.wm_window);
+            let property = connection
+                .get_reply(&x::InternAtom {
+                    name: b"FILE_VIEW_TEST",
+                    only_if_exists: false,
+                })
+                .atom();
+            connection
+                .send_and_check_request(&x::ConvertSelection {
+                    requestor: window,
+                    selection: connection.atoms.clipboard,
+                    target: connection.atoms.targets,
+                    property,
+                    time: x::CURRENT_TIME,
+                })
+                .unwrap();
+            let notify = connection.await_selection_notify();
+            assert_eq!(notify.property(), property);
+            let size = connection
+                .get_reply(&x::GetProperty {
+                    delete: false,
+                    window,
+                    property,
+                    r#type: x::ATOM_ATOM,
+                    long_offset: 0,
+                    long_length: 0,
+                })
+                .bytes_after();
+            let reply = connection.get_reply(&x::GetProperty {
+                delete: true,
+                window,
+                property,
+                r#type: x::ATOM_ATOM,
+                long_offset: 0,
+                long_length: 64,
+            });
+            let targets: &[x::Atom] = reply.value();
+            assert_eq!(size as usize, targets.len() * 4);
+            let expected_len = if index == 0 {
+                if limited { 1 } else { 4 }
+            } else {
+                1
+            };
+            assert_eq!(targets.len(), expected_len);
+            let mime = if index == 0 {
+                "text/uri-list"
+            } else {
+                "text/plain"
+            };
+            let atom = connection
+                .get_reply(&x::InternAtom {
+                    name: mime.as_bytes(),
+                    only_if_exists: false,
+                })
+                .atom();
+            assert!(targets.contains(&atom));
+            connection
+                .send_and_check_request(&x::ConvertSelection {
+                    requestor: window,
+                    selection: connection.atoms.clipboard,
+                    target: atom,
+                    property,
+                    time: x::CURRENT_TIME,
+                })
+                .unwrap();
+            f.wait_and_dispatch();
+            let notify = connection.await_selection_notify();
+            assert_eq!(notify.property(), property);
+            let reply = connection.get_reply(&x::GetProperty {
+                delete: true,
+                window,
+                property,
+                r#type: x::ATOM_ANY,
+                long_offset: 0,
+                long_length: 256,
+            });
+            let bytes: &[u8] = reply.value();
+            assert_eq!(
+                bytes,
+                offer
+                    .iter()
+                    .find(|item| item.mime_type == mime)
+                    .unwrap()
+                    .data
+            );
+            connection.verify_clipboard_owner(connection.wm_window);
+        }
+    }
 }
