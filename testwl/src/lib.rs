@@ -162,6 +162,7 @@ pub struct Toplevel {
     pub max_size: Option<Vec2>,
     pub states: Vec<xdg_toplevel::State>,
     pub closed: bool,
+    pub minimize_requests: usize,
     pub title: Option<String>,
     pub app_id: Option<String>,
     pub decoration: Option<(
@@ -1623,6 +1624,9 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                     None
                 };
             }
+            xdg_toplevel::Request::SetMinimized => {
+                state.get_toplevel(*surface_id).minimize_requests += 1;
+            }
             xdg_toplevel::Request::SetMaximized => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
@@ -1744,6 +1748,7 @@ impl Dispatch<XdgSurface, SurfaceId> for State {
                     max_size: None,
                     states: Vec::new(),
                     closed: false,
+                    minimize_requests: 0,
                     title: None,
                     app_id: None,
                     decoration: None,

@@ -1220,23 +1220,26 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.last_focused_toplevel.unwrap_or(x::WINDOW_NONE)
     }
 
-    pub fn minimize_window(&mut self, window: x::Window) {
+    pub fn minimize_window(&mut self, window: x::Window) -> bool {
         let Some(data) = self
             .windows
             .get(&window)
             .copied()
             .and_then(|id| self.world.entity(id).ok())
         else {
-            return;
+            return false;
         };
         let Some(role) = data.get::<&SurfaceRole>() else {
-            return;
+            return false;
         };
         if let SurfaceRole::Toplevel(Some(toplevel)) = &*role {
-            // Let the compositor own visibility and restoration. Do not unmap
-            // the X window or claim an iconic state before it accepts the request.
+            // Keep visibility and restoration owned by the compositor. The
+            // caller acknowledges this request through ICCCM WM_STATE so Qt
+            // can observe the later NormalState transition on restoration.
             toplevel.toplevel.set_minimized();
+            return true;
         }
+        false
     }
 
     pub fn set_maximized(&mut self, window: x::Window, state: super::xstate::SetState) {
