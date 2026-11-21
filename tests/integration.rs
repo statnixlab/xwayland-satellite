@@ -358,6 +358,7 @@ xcb::atoms_struct! {
         targets => b"TARGETS",
         multiple => b"MULTIPLE",
         wm_state => b"WM_STATE",
+        wm_change_state => b"WM_CHANGE_STATE",
         wm_check => b"_NET_SUPPORTING_WM_CHECK",
         win_type => b"_NET_WM_WINDOW_TYPE",
         win_type_normal => b"_NET_WM_WINDOW_TYPE_NORMAL",
@@ -2551,6 +2552,62 @@ fn rotated_output() {
 }
 
 const BTN_LEFT: u32 = 0x110;
+
+#[test]
+fn minimize_restore_repeats_with_icccm_state_notifications() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+    let wm_state = || {
+        connection
+            .get_reply(&x::GetProperty {
+                delete: false,
+                window,
+                property: connection.atoms.wm_state,
+                r#type: connection.atoms.wm_state,
+                long_offset: 0,
+                long_length: 2,
+            })
+            .value::<u32>()
+            .first()
+            .copied()
+    };
+    for cycle in 1..=3 {
+        assert_eq!(wm_state(), Some(WmState::Normal as u32));
+        connection.send_client_message(&x::ClientMessageEvent::new(
+            window,
+            connection.atoms.wm_change_state,
+            x::ClientMessageData::Data32([WmState::Iconic as u32, 0, 0, 0, 0]),
+        ));
+        f.wait_and_dispatch();
+        assert_eq!(
+            f.testwl
+                .get_surface_data(surface)
+                .unwrap()
+                .toplevel()
+                .minimize_requests,
+            cycle
+        );
+        assert_eq!(wm_state(), Some(WmState::Iconic as u32));
+        // The compositor keeps the same mapped X window while hiding it.
+        assert_eq!(
+            connection
+                .get_reply(&x::GetWindowAttributes { window })
+                .map_state(),
+            x::MapState::Viewable
+        );
+        f.testwl.unfocus_toplevel();
+        f.testwl.dispatch();
+        f.testwl.focus_toplevel(surface);
+        f.testwl.dispatch();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while wm_state() != Some(WmState::Normal as u32) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(wm_state(), Some(WmState::Normal as u32));
+    }
+}
 
 fn client_init_move_with_button(button: u32) {
     let mut f = Fixture::new();

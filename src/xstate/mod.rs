@@ -552,8 +552,24 @@ impl XState {
                 // ICCCM clients (including Electron and Qt on X11) request
                 // minimization with a 32-bit WM_CHANGE_STATE/IconicState.
                 if let x::ClientMessageData::Data32(data) = e.data() {
-                    if data[0] == WmState::Iconic as u32 {
-                        server_state.minimize_window(e.window());
+                    if data[0] == WmState::Iconic as u32 && server_state.minimize_window(e.window())
+                    {
+                        // Qt caches its requested state separately from the
+                        // last state notification. Without IconicState here,
+                        // focus_window's later NormalState looks unchanged and
+                        // a second minimize button click is discarded by Qt.
+                        // Do not unmap: Niri retains the same managed surface.
+                        if let Err(error) =
+                            self.connection.send_and_check_request(&x::ChangeProperty {
+                                mode: x::PropMode::Replace,
+                                window: e.window(),
+                                property: self.atoms.wm_state,
+                                r#type: self.atoms.wm_state,
+                                data: &[WmState::Iconic as u32, 0],
+                            })
+                        {
+                            debug!("Setting iconic state failed ({:?}: {error:?})", e.window());
+                        }
                     }
                 }
             }
