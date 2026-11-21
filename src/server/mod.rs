@@ -239,6 +239,7 @@ struct ToplevelData {
     toplevel: XdgToplevel,
     xdg: XdgSurfaceData,
     fullscreen: bool,
+    maximized: bool,
     decoration: decoration::DecorationsData,
 }
 
@@ -412,6 +413,27 @@ struct GlobalOutputOffset {
     y: GlobalOutputOffsetDimension,
 }
 
+struct XwaylandClientData;
+
+impl wayland_server::backend::ClientData for XwaylandClientData {
+    fn disconnected(
+        &self,
+        client: wayland_server::backend::ClientId,
+        reason: wayland_server::backend::DisconnectReason,
+    ) {
+        use wayland_server::backend::DisconnectReason;
+        match reason {
+            DisconnectReason::ConnectionClosed => {
+                warn!("Xwayland Wayland client {client:?} disconnected: connection closed")
+            }
+            DisconnectReason::ProtocolError(error) => warn!(
+                "Xwayland Wayland client {client:?} disconnected: protocol error code={} object={} interface={}",
+                error.code, error.object_id, error.object_interface,
+            ),
+        }
+    }
+}
+
 /// The state of the X11 connection before XState has been fully initialized.
 /// It implements XConnection minimally, gracefully doing nothing but logging the called functions.
 pub struct NoConnection<S: X11Selection + 'static> {
@@ -557,7 +579,9 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .with_list(|globals| handle_new_globals::<S>(&mut globals_map, &dh, globals));
 
         let world = MyWorld::new(global_list);
-        let client = dh.insert_client(client, std::sync::Arc::new(())).unwrap();
+        let client = dh
+            .insert_client(client, std::sync::Arc::new(XwaylandClientData))
+            .unwrap();
 
         let inner = InnerServerState {
             windows: HashMap::new(),
@@ -1185,6 +1209,63 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.last_focused_toplevel.unwrap_or(x::WINDOW_NONE)
     }
 
+    pub fn minimize_window(&mut self, window: x::Window) -> bool {
+        let Some(data) = self
+            .windows
+            .get(&window)
+            .copied()
+            .and_then(|id| self.world.entity(id).ok())
+        else {
+            return false;
+        };
+        let Some(role) = data.get::<&SurfaceRole>() else {
+            return false;
+        };
+        if let SurfaceRole::Toplevel(Some(toplevel)) = &*role {
+            // Keep visibility and restoration owned by the compositor. The
+            // caller acknowledges this request through ICCCM WM_STATE so Qt
+            // can observe the later NormalState transition on restoration.
+            toplevel.toplevel.set_minimized();
+            return true;
+        }
+        false
+    }
+
+    pub fn set_maximized(&mut self, window: x::Window, state: super::xstate::SetState) {
+        let Some(data) = self
+            .windows
+            .get(&window)
+            .copied()
+            .and_then(|id| self.world.entity(id).ok())
+        else {
+            warn!("Tried to set unknown window {window:?} maximized");
+            return;
+        };
+
+        let Some(role) = data.get::<&SurfaceRole>() else {
+            warn!("Tried to set window without role maximized: {window:?}");
+            return;
+        };
+
+        let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
+            warn!("Tried to set an unmapped toplevel or non toplevel maximized: {window:?}");
+            return;
+        };
+
+        use crate::xstate::SetState;
+        match state {
+            SetState::Add => toplevel.toplevel.set_maximized(),
+            SetState::Remove => toplevel.toplevel.unset_maximized(),
+            SetState::Toggle => {
+                if toplevel.maximized {
+                    toplevel.toplevel.unset_maximized()
+                } else {
+                    toplevel.toplevel.set_maximized()
+                }
+            }
+        }
+    }
+
     pub fn set_fullscreen(&mut self, window: x::Window, state: super::xstate::SetState) {
         let Some(data) = self
             .windows
@@ -1581,6 +1662,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             },
             toplevel,
             fullscreen: false,
+            maximized: false,
             decoration: DecorationsData {
                 wl: wl_decoration,
                 satellite: sat_decoration,

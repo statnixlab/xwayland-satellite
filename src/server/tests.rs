@@ -4,7 +4,7 @@ use crate::xstate::{SetState, WinSize, WmName};
 use crate::{XConnection, timespec_from_millis};
 use rustix::event::{PollFd, PollFlags, poll};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -1219,6 +1219,59 @@ fn override_redirect_window_after_toplevel_close() {
 }
 
 #[test]
+fn maximized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    f.satellite.set_maximized(win, SetState::Add);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Remove);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+#[test]
 fn fullscreen() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let win = Window::new(1);
@@ -1513,7 +1566,13 @@ fn copy_from_wayland<T: SelectionTest>() {
                     f.testwl.dispatch();
                 }
             });
-            selection.receive(mime.mime_type.clone(), &f.satellite)
+            {
+                let mut pipe = selection.receive(mime.mime_type.clone()).unwrap();
+                f.satellite.queue.flush().unwrap();
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).unwrap();
+                data
+            }
         });
         f.run();
         assert_eq!(data, mime.data);
@@ -1574,7 +1633,13 @@ fn selection_x11_then_wayland<T: SelectionTest>() {
                     f.testwl.dispatch();
                 }
             });
-            selection.receive(mime.mime_type.clone(), &f.satellite)
+            {
+                let mut pipe = selection.receive(mime.mime_type.clone()).unwrap();
+                f.satellite.queue.flush().unwrap();
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).unwrap();
+                data
+            }
         });
         f.run();
         assert_eq!(data, mime.data);
@@ -1602,6 +1667,54 @@ fn raise_window_on_pointer_event() {
     f.run();
     assert_eq!(f.connection().focused_window, Some(win2));
     assert_eq!(f.satellite.last_hovered, Some(win1));
+}
+
+#[test]
+fn hidpi_cursor_protocol_keeps_windows_unscaled() {
+    let expected: i32 = std::env::var("XWS_CURSOR_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let (_, cursor) = comp.create_surface();
+    f.run();
+    let cursor_id = f.testwl.last_created_surface_id().unwrap();
+    pointer
+        .send_request(Req::<WlPointer>::SetCursor {
+            serial: 0,
+            surface: Some(cursor.obj.clone()),
+            hotspot_x: 10,
+            hotspot_y: 14,
+        })
+        .unwrap();
+    f.run();
+    let data = f.testwl.get_surface_data(cursor_id).unwrap();
+    assert_eq!(data.buffer_scale, expected);
+    assert_eq!(data.cursor_hotspot, Some((10 / expected, 14 / expected)));
+
+    // Xwayland may resend scale=1 on every pointer-enter or shape change.
+    cursor
+        .send_request(Req::<WlSurface>::SetBufferScale { scale: 1 })
+        .unwrap();
+    cursor.send_request(Req::<WlSurface>::Commit {}).unwrap();
+    f.run();
+    assert_eq!(
+        f.testwl.get_surface_data(cursor_id).unwrap().buffer_scale,
+        expected
+    );
+
+    let (_, window) = comp.create_surface();
+    window
+        .send_request(Req::<WlSurface>::SetBufferScale { scale: 1 })
+        .unwrap();
+    f.run();
+    let window_id = f.testwl.last_created_surface_id().unwrap();
+    assert_eq!(
+        f.testwl.get_surface_data(window_id).unwrap().buffer_scale,
+        1
+    );
 }
 
 #[test]
