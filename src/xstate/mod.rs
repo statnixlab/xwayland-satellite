@@ -292,6 +292,8 @@ impl XState {
                 self.atoms.motif_wm_hints,
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
+                self.atoms.wm_maximized_horz,
+                self.atoms.wm_maximized_vert,
                 self.atoms.moveresize,
             ],
         );
@@ -537,6 +539,15 @@ impl XState {
                 };
                 server_state.set_window_serial(e.window(), [data[0], data[1]]);
             }
+            x if x == self.atoms.wm_change_state => {
+                // ICCCM clients (including Electron and Qt on X11) request
+                // minimization with a 32-bit WM_CHANGE_STATE/IconicState.
+                if let x::ClientMessageData::Data32(data) = e.data() {
+                    if data[0] == WmState::Iconic as u32 {
+                        server_state.minimize_window(e.window());
+                    }
+                }
+            }
             x if x == self.atoms.net_wm_state => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
                     unreachable!();
@@ -550,6 +561,13 @@ impl XState {
 
                 trace!("_NET_WM_STATE ({action:?}) props: {prop1:?} {prop2:?}");
 
+                // Both EWMH axes represent one Wayland maximize request.
+                // Process once so a pair of TOGGLE atoms cannot cancel itself.
+                if [prop1, prop2].iter().any(|prop| {
+                    *prop == self.atoms.wm_maximized_horz || *prop == self.atoms.wm_maximized_vert
+                }) {
+                    server_state.set_maximized(e.window(), action);
+                }
                 for prop in [prop1, prop2] {
                     match prop {
                         x if x == self.atoms.wm_fullscreen => {
@@ -623,6 +641,7 @@ impl XState {
         if title.is_none() {
             title = self.get_wm_name(window)?;
         }
+        let wm_name = title.as_ref().map(|title| title.name().to_owned());
         if let Some(name) = title {
             server_state.set_win_title(window, name);
         }
@@ -664,6 +683,7 @@ impl XState {
             window_types,
             motif_wm_hints,
             wm_class,
+            wm_name,
             wm_normal_hints: size_hints,
         };
         let role = heuristics.guess_window_role(&self.window_atoms);
@@ -896,12 +916,15 @@ xcb::atoms_struct! {
         wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
         wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
         wm_state => b"WM_STATE" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         wm_s0 => b"WM_S0" only_if_exists = false,
         net_wm_cm_s0 => b"_NET_WM_CM_S0" only_if_exists = false,
         wm_check => b"_NET_SUPPORTING_WM_CHECK" only_if_exists = false,
         net_wm_name => b"_NET_WM_NAME" only_if_exists = false,
         wm_pid => b"_NET_WM_PID" only_if_exists = false,
         net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
+        wm_maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
@@ -927,6 +950,7 @@ xcb::atoms_struct! {
     struct WindowTypes {
         ty => b"_NET_WM_WINDOW_TYPE" only_if_exists = false,
         normal => b"_NET_WM_WINDOW_TYPE_NORMAL" only_if_exists = false,
+        kde_override => b"_KDE_NET_WM_WINDOW_TYPE_OVERRIDE" only_if_exists = false,
         dialog => b"_NET_WM_WINDOW_TYPE_DIALOG" only_if_exists = false,
         drag_n_drop => b"_NET_WM_WINDOW_TYPE_DND" only_if_exists = false,
         splash => b"_NET_WM_WINDOW_TYPE_SPLASH" only_if_exists = false,
@@ -1144,6 +1168,7 @@ struct WindowRoleHeuristics {
     window_types: Vec<x::Atom>,
     motif_wm_hints: Option<motif::Hints>,
     wm_class: Option<String>,
+    wm_name: Option<String>,
     wm_normal_hints: Option<WmNormalHints>,
 }
 impl WindowRoleHeuristics {
@@ -1175,6 +1200,26 @@ impl WindowRoleHeuristics {
                 .zip(hints.max_size)
                 .is_some_and(|(min, max)| min == max)
         });
+
+        // WPS Writer/Spreadsheets 12's selection toolbar is a fixed-size, borderless tool
+        // window, but Qt advertises it as KDE_OVERRIDE + NORMAL without a
+        // transient parent. A toplevel loses its requested position and WPS
+        // immediately dismisses it when the pointer moves. Keep this narrow:
+        // titled dialogs, resizable documents and other applications stay
+        // toplevels. Normal popup parenting/positioning handles the toolbar.
+        let is_wps_selection_toolbar = matches!(
+            (self.wm_class.as_deref(), self.wm_name.as_deref()),
+            (Some("wps"), Some("wps")) | (Some("et"), Some("et"))
+        );
+        if is_wps_selection_toolbar
+            && !self.has_transient_for
+            && motif_no_decor
+            && forced_size
+            && self.window_types.contains(&window_atoms.kde_override)
+            && self.window_types.contains(&window_atoms.normal)
+        {
+            return WindowRole::Popup;
+        }
 
         let mut window_types = self.window_types.clone();
         if self.window_types.is_empty() {
@@ -1350,11 +1395,18 @@ impl XConnection for RealConnection {
     }
 
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
-        let data = if fullscreen {
-            std::slice::from_ref(&self.atoms.wm_fullscreen)
-        } else {
-            &[]
-        };
+        self.set_toplevel_state(window, fullscreen, false);
+    }
+
+    fn set_toplevel_state(&mut self, window: x::Window, fullscreen: bool, maximized: bool) {
+        let mut states = Vec::new();
+        if fullscreen {
+            states.push(self.atoms.wm_fullscreen);
+        }
+        if maximized {
+            states.extend([self.atoms.wm_maximized_horz, self.atoms.wm_maximized_vert]);
+        }
+        let data = states.as_slice();
 
         if let Err(e) = self
             .connection

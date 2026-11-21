@@ -6,6 +6,7 @@ impl WindowTypes {
         Self {
             ty: Atom::new(0x100),
             normal: Atom::new(0x101),
+            kde_override: Atom::new(0x10b),
             dialog: Atom::new(0x102),
             drag_n_drop: Atom::new(0x103),
             splash: Atom::new(0x104),
@@ -123,6 +124,7 @@ mod window_role_heuristics {
             .program_size(133, 28)
             .win_gravity(Gravity::NorthWest);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.dialog],
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0, 0, 0, 0].as_slice())),
@@ -139,6 +141,7 @@ mod window_role_heuristics {
         let win_types = WindowTypes::new();
         let wm_normal_hints = WmNormalHints::new().program_size(936, 1048);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             motif_wm_hints: Some(motif::Hints::from([0x2_u32, 0, 0x11, 0, 0].as_slice())),
             window_types: vec![win_types.normal],
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -157,6 +160,7 @@ mod window_role_heuristics {
             .min_size(382, 160)
             .max_size(382, 160);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             override_redirect: true,
             wm_normal_hints: Some(wm_normal_hints.into()),
             wm_class: Some("REAPER".into()),
@@ -171,6 +175,7 @@ mod window_role_heuristics {
     fn chromium_tooltip() {
         let win_types = WindowTypes::new();
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.menu],
             ..Default::default()
         };
@@ -183,6 +188,7 @@ mod window_role_heuristics {
     fn discord_dnd() {
         let win_types = WindowTypes::new();
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.drag_n_drop],
             override_redirect: true,
             ..Default::default()
@@ -200,6 +206,7 @@ mod window_role_heuristics {
             .min_size(1, 1)
             .resize_incr(1, 1);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.popup_menu],
             override_redirect: true,
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -214,6 +221,7 @@ mod window_role_heuristics {
     fn dropdown_menu() {
         let win_types = WindowTypes::new();
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.dropdown_menu],
             ..Default::default()
         };
@@ -234,6 +242,7 @@ mod window_role_heuristics {
             .base_size(0, 0)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             override_redirect: true,
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x2_u32, 1, 0, 0, 0].as_slice())),
@@ -255,6 +264,7 @@ mod window_role_heuristics {
             .min_size(245, 329)
             .max_size(245, 329);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             wm_normal_hints: Some(wm_normal_hints.into()),
             override_redirect: true,
@@ -275,6 +285,7 @@ mod window_role_heuristics {
             .min_size(340, 400)
             .max_size(340, 400);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             wm_normal_hints: Some(wm_normal_hints.into()),
             window_types: vec![win_types.utility],
@@ -296,6 +307,7 @@ mod window_role_heuristics {
             .max_size(1190, 769)
             .win_gravity(Gravity::NorthWest);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.utility],
             wm_normal_hints: Some(wm_normal_hints.into()),
             wm_class: Some("Ardour-8.12.0".into()),
@@ -311,6 +323,7 @@ mod window_role_heuristics {
             .min_size(633, 397)
             .win_gravity(Gravity::NorthWest);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             window_types: vec![win_types.utility],
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -331,6 +344,7 @@ mod window_role_heuristics {
             .min_size(660, 590)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x2_u32, 0x1, 0, 0, 0].as_slice())),
             window_types: vec![win_types.utility, win_types.normal],
@@ -346,6 +360,7 @@ mod window_role_heuristics {
     fn fcitx5_popup() {
         let win_types = WindowTypes::new();
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.combo],
             override_redirect: true,
             wm_class: Some("fcitx".into()),
@@ -366,6 +381,7 @@ mod window_role_heuristics {
             .max_size(307, 700)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.normal],
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0x24, 0, 0, 0].as_slice())),
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -386,6 +402,7 @@ mod window_role_heuristics {
             .max_size(1600, 800)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.normal],
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0x24, 0, 0, 0].as_slice())),
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -403,6 +420,7 @@ mod window_role_heuristics {
             .max_size(362, 645)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.normal],
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0x2c, 0, 0, 0].as_slice())),
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -419,6 +437,7 @@ mod window_role_heuristics {
             .program_pos(1920, 0)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.normal],
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0x3e, 0, 0, 0].as_slice())),
             wm_normal_hints: Some(wm_normal_hints.into()),
@@ -439,6 +458,7 @@ mod window_role_heuristics {
             .max_size(363, 801)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             motif_wm_hints: Some(motif::Hints::from([0x3_u32, 0x24, 0, 0, 0].as_slice())),
             window_types: vec![win_types.dialog],
             has_transient_for: true,
@@ -463,6 +483,7 @@ mod window_role_heuristics {
             .base_size(-2 as _, -2 as _)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x2_u32, 0x1, 0, 0, 0].as_slice())),
             window_types: vec![win_types.dialog, win_types.normal],
@@ -484,6 +505,7 @@ mod window_role_heuristics {
             .min_size(371, 356)
             .win_gravity(Gravity::Static);
         let win = WindowRoleHeuristics {
+            wm_name: None,
             has_transient_for: true,
             motif_wm_hints: Some(motif::Hints::from([0x3, 0x26, 0x1e, 0x0, 0x0].as_slice())),
             window_types: vec![win_types.dialog, win_types.normal],
@@ -498,9 +520,88 @@ mod window_role_heuristics {
     fn splash_screen() {
         let win_types = WindowTypes::new();
         let win = WindowRoleHeuristics {
+            wm_name: None,
             window_types: vec![win_types.splash],
             ..Default::default()
         };
         assert_eq!(win.guess_window_role(&win_types), WindowRole::Splash);
     }
+}
+
+// Captured from WPS Writer 12.1.2.29183's text-selection mini toolbar.
+fn wps_toolbar_hints(types: &WindowTypes) -> WindowRoleHeuristics {
+    WindowRoleHeuristics {
+        wm_class: Some("wps".into()),
+        wm_name: Some("wps".into()),
+        motif_wm_hints: Some(motif::Hints::from([0x2_u32, 1, 0, 0, 0].as_slice())),
+        window_types: vec![types.kde_override, types.normal],
+        wm_normal_hints: Some(WmNormalHints::new().user_pos(1804, 606)
+            .user_size(676, 178).min_size(676, 178).max_size(676, 178)
+            .win_gravity(xcb::x::Gravity::Static).into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn wps_selection_toolbar_is_popup() {
+    let types = WindowTypes::new();
+    assert_eq!(wps_toolbar_hints(&types).guess_window_role(&types), WindowRole::Popup);
+}
+
+#[test]
+fn wps_document_and_dialog_windows_remain_toplevels() {
+    let types = WindowTypes::new();
+    let mut titled = wps_toolbar_hints(&types);
+    titled.wm_name = Some("Document preferences".into());
+    assert_eq!(titled.guess_window_role(&types), WindowRole::Toplevel);
+    let mut resizable = wps_toolbar_hints(&types);
+    resizable.wm_normal_hints = Some(WmNormalHints::new().min_size(500, 300).into());
+    assert_eq!(resizable.guess_window_role(&types), WindowRole::Toplevel);
+    let mut transient = wps_toolbar_hints(&types);
+    transient.has_transient_for = true;
+    assert_eq!(transient.guess_window_role(&types), WindowRole::Toplevel);
+}
+
+#[test]
+fn wps_toolbar_workaround_does_not_match_other_windows() {
+    let types = WindowTypes::new();
+    let mut other = wps_toolbar_hints(&types);
+    other.wm_class = Some("other-qt-app".into());
+    assert_eq!(other.guess_window_role(&types), WindowRole::Toplevel);
+    let mut no_hint = wps_toolbar_hints(&types);
+    no_hint.window_types = vec![types.normal];
+    assert_eq!(no_hint.guess_window_role(&types), WindowRole::Toplevel);
+    let mut decorated = wps_toolbar_hints(&types);
+    decorated.motif_wm_hints = None;
+    assert_eq!(decorated.guess_window_role(&types), WindowRole::Toplevel);
+}
+
+// Captured from the Spreadsheet selection toolbar: et/et, 824x128,
+// NORMAL + KDE_OVERRIDE, no transient parent, no override_redirect.
+#[test]
+fn et_selection_toolbar_is_popup_without_raising_floating_layer() {
+    let types = WindowTypes::new();
+    let mut toolbar = wps_toolbar_hints(&types);
+    toolbar.wm_class = Some("et".into());
+    toolbar.wm_name = Some("et".into());
+    toolbar.wm_normal_hints = Some(WmNormalHints::new().user_pos(2126, 538)
+        .user_size(824, 128).min_size(824, 128).max_size(824, 128)
+        .win_gravity(xcb::x::Gravity::Static).into());
+    assert_eq!(toolbar.guess_window_role(&types), WindowRole::Popup);
+}
+
+#[test]
+fn et_workbook_and_named_dialog_are_not_selection_popups() {
+    let types = WindowTypes::new();
+    let mut window = wps_toolbar_hints(&types);
+    window.wm_class = Some("et".into());
+    window.wm_name = Some("workbook.xlsx".into());
+    assert_eq!(window.guess_window_role(&types), WindowRole::Toplevel);
+    window.wm_name = Some("et".into());
+    window.wm_normal_hints = Some(WmNormalHints::new().min_size(400, 200).into());
+    assert_eq!(window.guess_window_role(&types), WindowRole::Toplevel);
+    let mut other = wps_toolbar_hints(&types);
+    other.wm_class = Some("wpp".into());
+    other.wm_name = Some("wpp".into());
+    assert_eq!(other.guess_window_role(&types), WindowRole::Toplevel);
 }

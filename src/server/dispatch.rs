@@ -65,6 +65,47 @@ use wayland_server::{
     },
 };
 
+// Local, opt-in workaround for upstream issue #194. X11 clients on this
+// dedicated instance load scale-times-larger cursors; only cursor surfaces
+// are divided back to logical size. Ordinary application buffers are unchanged.
+struct HiDpiCursor(i32);
+
+fn parse_cursor_scale(value: Option<&str>) -> i32 {
+    value.and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| (1..=4).contains(v))
+        .unwrap_or(1)
+}
+
+fn cursor_scale_override() -> i32 {
+    static SCALE: OnceLock<i32> = OnceLock::new();
+    *SCALE.get_or_init(|| parse_cursor_scale(std::env::var("XWS_CURSOR_SCALE").ok().as_deref()))
+}
+
+fn cursor_hotspot(x: i32, y: i32, scale: i32) -> (i32, i32) {
+    (x.div_euclid(scale), y.div_euclid(scale))
+}
+
+#[cfg(test)]
+mod hidpi_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn workaround_is_opt_in_and_bounded() {
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("5"), Some("1.5")] {
+            assert_eq!(parse_cursor_scale(value), 1);
+        }
+        assert_eq!(parse_cursor_scale(Some("2")), 2);
+        assert_eq!(parse_cursor_scale(Some("4")), 4);
+    }
+
+    #[test]
+    fn hotspot_uses_logical_coordinates() {
+        assert_eq!(cursor_hotspot(10, 14, 2), (5, 7));
+        assert_eq!(cursor_hotspot(11, 15, 2), (5, 7));
+        assert_eq!(cursor_hotspot(10, 14, 1), (10, 14));
+    }
+}
+
 // noop
 impl<S: X11Selection> Dispatch<WlCallback, ()> for InnerServerState<S> {
     fn request(
@@ -167,6 +208,7 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 }
             }
             Request::<WlSurface>::SetBufferScale { scale } => {
+                let scale = data.get::<&HiDpiCursor>().map_or(scale, |cursor| cursor.0);
                 client.set_buffer_scale(scale);
             }
             Request::<WlSurface>::SetInputRegion { region } => {
@@ -358,6 +400,17 @@ impl<S: X11Selection> Dispatch<WlPointer, Entity> for InnerServerState<S> {
                 hotspot_y,
                 surface,
             } => {
+                let scale = cursor_scale_override();
+                if scale != 1 {
+                    if let Some(cursor_entity) = surface.as_ref().and_then(|s| s.data().copied()) {
+                        state.world.insert_one(cursor_entity, HiDpiCursor(scale)).unwrap();
+                        let cursor_surface = state.world
+                            .get::<&client::wl_surface::WlSurface>(cursor_entity).unwrap();
+                        cursor_surface.set_buffer_scale(scale);
+                        cursor_surface.commit();
+                    }
+                }
+                let (hotspot_x, hotspot_y) = cursor_hotspot(hotspot_x, hotspot_y, scale);
                 let c_pointer = state
                     .world
                     .get::<&client::wl_pointer::WlPointer>(*entity)

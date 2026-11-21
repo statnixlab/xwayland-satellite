@@ -162,6 +162,7 @@ struct FakeXConnection {
     focused_window: Option<Window>,
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
+    maximized: HashMap<Window, bool>,
 }
 
 impl FakeXConnection {
@@ -211,6 +212,12 @@ impl super::XConnection for FakeXConnection {
     #[track_caller]
     fn set_fullscreen(&mut self, window: xcb::x::Window, fullscreen: bool) {
         self.window_mut(window).fullscreen = fullscreen;
+    }
+
+    fn set_toplevel_state(&mut self, window: Window, fullscreen: bool, maximized: bool) {
+        let data = self.window_mut(window);
+        data.fullscreen = fullscreen;
+        self.maximized.insert(window, maximized);
     }
 
     #[track_caller]
@@ -1219,6 +1226,88 @@ fn override_redirect_window_after_toplevel_close() {
 }
 
 #[test]
+fn maximized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    f.satellite.set_maximized(win, SetState::Add);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Remove);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        data.toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+
+    f.satellite.set_maximized(win, SetState::Toggle);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    assert!(
+        !data
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized)
+    );
+}
+
+// WPS emits two identical messages for each click. The custom Niri mode
+// toggles on set_maximized and sends configure without the Maximized state.
+#[test]
+fn column_maximized_duplicate_wps_requests() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+    {
+        let entity = f.satellite.windows[&win];
+        let mut role = f.satellite.world.get::<&mut super::SurfaceRole>(entity).unwrap();
+        let super::SurfaceRole::Toplevel(Some(toplevel)) = &mut *role else { panic!() };
+        toplevel.column_maximized = Some(false);
+    }
+    for (action, expected) in [(SetState::Add, true), (SetState::Remove, false), (SetState::Add, true)] {
+        f.satellite.set_maximized(win, action);
+        f.satellite.set_maximized(win, action);
+        f.run();
+        f.run();
+        // The fixture records one Maximized entry per set_maximized request.
+        // Even REMOVE must forward one set request for Niri's toggle protocol.
+        assert_eq!(f.testwl.get_surface_data(id).unwrap().toplevel().states
+            .iter().filter(|s| **s == xdg_toplevel::State::Maximized).count(), 1);
+        f.testwl.configure_toplevel(id, 900, 700, vec![]);
+        f.run();
+        f.run();
+        assert_eq!(f.connection().maximized.get(&win), Some(&expected));
+    }
+}
+
+#[test]
 fn fullscreen() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let win = Window::new(1);
@@ -1602,6 +1691,37 @@ fn raise_window_on_pointer_event() {
     f.run();
     assert_eq!(f.connection().focused_window, Some(win2));
     assert_eq!(f.satellite.last_hovered, Some(win1));
+}
+
+#[test]
+fn hidpi_cursor_protocol_keeps_windows_unscaled() {
+    let expected: i32 = std::env::var("XWS_CURSOR_SCALE").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(1);
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let pointer = TestObject::<WlPointer>::from_request(
+        &comp.seat.obj, wl_seat::Request::GetPointer {});
+    let (_, cursor) = comp.create_surface();
+    f.run();
+    let cursor_id = f.testwl.last_created_surface_id().unwrap();
+    pointer.send_request(Req::<WlPointer>::SetCursor {
+        serial: 0, surface: Some(cursor.obj.clone()), hotspot_x: 10, hotspot_y: 14,
+    }).unwrap();
+    f.run();
+    let data = f.testwl.get_surface_data(cursor_id).unwrap();
+    assert_eq!(data.buffer_scale, expected);
+    assert_eq!(data.cursor_hotspot, Some((10 / expected, 14 / expected)));
+
+    // Xwayland may resend scale=1 on every pointer-enter or shape change.
+    cursor.send_request(Req::<WlSurface>::SetBufferScale { scale: 1 }).unwrap();
+    cursor.send_request(Req::<WlSurface>::Commit {}).unwrap();
+    f.run();
+    assert_eq!(f.testwl.get_surface_data(cursor_id).unwrap().buffer_scale, expected);
+
+    let (_, window) = comp.create_surface();
+    window.send_request(Req::<WlSurface>::SetBufferScale { scale: 1 }).unwrap();
+    f.run();
+    let window_id = f.testwl.last_created_surface_id().unwrap();
+    assert_eq!(f.testwl.get_surface_data(window_id).unwrap().buffer_scale, 1);
 }
 
 #[test]

@@ -108,6 +108,8 @@ pub struct Viewport {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SurfaceData {
     pub surface: WlSurface,
+    pub buffer_scale: i32,
+    pub cursor_hotspot: Option<(i32, i32)>,
     pub buffer: Option<WlBuffer>,
     pub last_damage: Option<BufferDamage>,
     pub role: Option<SurfaceRole>,
@@ -336,7 +338,7 @@ impl State {
         toplevel.states = states.clone();
         let states: Vec<u8> = states
             .into_iter()
-            .map(|state| u32::from(state) as u8)
+            .flat_map(|state| u32::from(state).to_ne_bytes())
             .collect();
         toplevel.toplevel.configure(width, height, states);
         toplevel.xdg.configure(last_serial);
@@ -1447,9 +1449,10 @@ impl Dispatch<WlPointer, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         match request {
-            wl_pointer::Request::SetCursor { surface, .. } => {
+            wl_pointer::Request::SetCursor { surface, hotspot_x, hotspot_y, .. } => {
                 if let Some(surface) = surface {
                     let data = state.surfaces.get_mut(&SurfaceId::from(&surface)).unwrap();
+                    data.cursor_hotspot = Some((hotspot_x, hotspot_y));
 
                     assert!(
                         matches!(
@@ -1568,6 +1571,32 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 } else {
                     None
                 };
+            }
+            xdg_toplevel::Request::SetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                toplevel.states.push(xdg_toplevel::State::Maximized);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
+            }
+            xdg_toplevel::Request::UnsetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                let Some(pos) = toplevel
+                    .states
+                    .iter()
+                    .copied()
+                    .position(|p| p == xdg_toplevel::State::Maximized)
+                else {
+                    return;
+                };
+                toplevel.states.swap_remove(pos);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
             }
             xdg_toplevel::Request::SetFullscreen { .. } => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();
@@ -1957,6 +1986,8 @@ impl Dispatch<WlCompositor, ()> for State {
                     SurfaceId(id),
                     SurfaceData {
                         surface,
+                        buffer_scale: 1,
+                        cursor_hotspot: None,
                         buffer: None,
                         last_damage: None,
                         role: None,
@@ -2059,7 +2090,7 @@ impl Dispatch<WlSurface, ()> for State {
                 state.surfaces.remove(&id);
             }
             SetInputRegion { .. } => {}
-            SetBufferScale { .. } => {}
+            SetBufferScale { scale } => data.buffer_scale = scale,
             other => todo!("unhandled request {other:?}"),
         }
     }
