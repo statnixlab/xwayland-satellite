@@ -338,7 +338,7 @@ impl State {
         toplevel.states = states.clone();
         let states: Vec<u8> = states
             .into_iter()
-            .map(|state| u32::from(state) as u8)
+            .flat_map(|state| u32::from(state).to_ne_bytes())
             .collect();
         toplevel.toplevel.configure(width, height, states);
         toplevel.xdg.configure(last_serial);
@@ -1580,6 +1580,32 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 } else {
                     None
                 };
+            }
+            xdg_toplevel::Request::SetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                toplevel.states.push(xdg_toplevel::State::Maximized);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
+            }
+            xdg_toplevel::Request::UnsetMaximized => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                let Some(pos) = toplevel
+                    .states
+                    .iter()
+                    .copied()
+                    .position(|p| p == xdg_toplevel::State::Maximized)
+                else {
+                    return;
+                };
+                toplevel.states.swap_remove(pos);
+                let states = toplevel.states.clone();
+                state.configure_toplevel(*surface_id, 100, 100, states);
             }
             xdg_toplevel::Request::SetFullscreen { .. } => {
                 let data = state.surfaces.get_mut(surface_id).unwrap();

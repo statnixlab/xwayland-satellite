@@ -293,6 +293,8 @@ impl XState {
                 self.atoms.motif_wm_hints,
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
+                self.atoms.wm_maximized_horz,
+                self.atoms.wm_maximized_vert,
                 self.atoms.moveresize,
             ],
         );
@@ -559,6 +561,13 @@ impl XState {
 
                 trace!("_NET_WM_STATE ({action:?}) props: {prop1:?} {prop2:?}");
 
+                // Both EWMH axes represent one Wayland maximize request.
+                // Process once so a pair of TOGGLE atoms cannot cancel itself.
+                if [prop1, prop2].iter().any(|prop| {
+                    *prop == self.atoms.wm_maximized_horz || *prop == self.atoms.wm_maximized_vert
+                }) {
+                    server_state.set_maximized(e.window(), action);
+                }
                 for prop in [prop1, prop2] {
                     match prop {
                         x if x == self.atoms.wm_fullscreen => {
@@ -912,6 +921,8 @@ xcb::atoms_struct! {
         net_wm_name => b"_NET_WM_NAME" only_if_exists = false,
         wm_pid => b"_NET_WM_PID" only_if_exists = false,
         net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
+        wm_maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
@@ -1368,11 +1379,18 @@ impl XConnection for RealConnection {
     }
 
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
-        let data = if fullscreen {
-            std::slice::from_ref(&self.atoms.wm_fullscreen)
-        } else {
-            &[]
-        };
+        self.set_toplevel_state(window, fullscreen, false);
+    }
+
+    fn set_toplevel_state(&mut self, window: x::Window, fullscreen: bool, maximized: bool) {
+        let mut states = Vec::new();
+        if fullscreen {
+            states.push(self.atoms.wm_fullscreen);
+        }
+        if maximized {
+            states.extend([self.atoms.wm_maximized_horz, self.atoms.wm_maximized_vert]);
+        }
+        let data = states.as_slice();
 
         if let Err(e) = self
             .connection
