@@ -414,6 +414,27 @@ struct GlobalOutputOffset {
     y: GlobalOutputOffsetDimension,
 }
 
+struct XwaylandClientData;
+
+impl wayland_server::backend::ClientData for XwaylandClientData {
+    fn disconnected(
+        &self,
+        client: wayland_server::backend::ClientId,
+        reason: wayland_server::backend::DisconnectReason,
+    ) {
+        use wayland_server::backend::DisconnectReason;
+        match reason {
+            DisconnectReason::ConnectionClosed => {
+                warn!("Xwayland Wayland client {client:?} disconnected: connection closed")
+            }
+            DisconnectReason::ProtocolError(error) => warn!(
+                "Xwayland Wayland client {client:?} disconnected: protocol error code={} object={} interface={}",
+                error.code, error.object_id, error.object_interface,
+            ),
+        }
+    }
+}
+
 /// The state of the X11 connection before XState has been fully initialized.
 /// It implements XConnection minimally, gracefully doing nothing but logging the called functions.
 pub struct NoConnection<S: X11Selection + 'static> {
@@ -563,7 +584,9 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .with_list(|globals| handle_new_globals::<S>(&mut globals_map, &dh, globals));
 
         let world = MyWorld::new(global_list);
-        let client = dh.insert_client(client, std::sync::Arc::new(())).unwrap();
+        let client = dh
+            .insert_client(client, std::sync::Arc::new(XwaylandClientData))
+            .unwrap();
 
         let inner = InnerServerState {
             windows: HashMap::new(),
