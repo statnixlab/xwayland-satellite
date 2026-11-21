@@ -1,4 +1,5 @@
 mod server;
+mod transfer;
 pub mod xstate;
 
 use crate::server::{NoConnection, PendingSurfaceState, ServerState};
@@ -19,6 +20,9 @@ pub trait XConnection: Sized + 'static {
 
     fn set_window_dims(&mut self, window: x::Window, dims: PendingSurfaceState) -> bool;
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool);
+    fn set_toplevel_state(&mut self, window: x::Window, fullscreen: bool, _maximized: bool) {
+        self.set_fullscreen(window, fullscreen);
+    }
     fn focus_window(&mut self, window: x::Window, output_name: Option<String>);
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
@@ -241,7 +245,19 @@ pub fn main(mut data: impl RunData) -> Option<()> {
             xstate.update_global_scale(scale);
         }
 
-        match poll(&mut fds, None) {
+        xstate.advance_selection_transfers();
+
+        // Synchronous X11 replies can pull events into XCB's userspace queue.
+        // Check it before sleeping: the underlying socket is no longer readable.
+        if xstate.has_queued_event() {
+            continue;
+        }
+        // Only wake periodically while a clipboard transfer is in flight. Every
+        // pipe is nonblocking and bounded per pass, so input/frames keep flowing.
+        let transfer_timeout = xstate
+            .has_pending_selection_transfers()
+            .then(|| timespec_from_millis(20));
+        match poll(&mut fds, transfer_timeout.as_ref()) {
             Ok(_) => {
                 if !fds[3].revents().is_empty() {
                     let status = xwayland_exit_code(&mut quit_rx);

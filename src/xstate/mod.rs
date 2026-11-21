@@ -110,6 +110,7 @@ pub struct XState {
     selection_state: SelectionState,
     settings: Settings,
     max_req_bytes: usize,
+    queued_event: Option<xcb::Event>,
 }
 
 impl XState {
@@ -230,6 +231,7 @@ impl XState {
             selection_state,
             settings,
             max_req_bytes,
+            queued_event: None,
         };
         r.create_ewmh_window();
         r.set_xsettings_owner();
@@ -292,6 +294,8 @@ impl XState {
                 self.atoms.motif_wm_hints,
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
+                self.atoms.wm_maximized_horz,
+                self.atoms.wm_maximized_vert,
                 self.atoms.moveresize,
             ],
         );
@@ -333,6 +337,13 @@ impl XState {
             .unwrap();
     }
 
+    pub(crate) fn has_queued_event(&mut self) -> bool {
+        if self.queued_event.is_none() {
+            self.queued_event = self.connection.poll_for_queued_event().unwrap();
+        }
+        self.queued_event.is_some()
+    }
+
     pub fn handle_events(&mut self, server_state: &mut super::RealServerState) {
         macro_rules! unwrap_or_skip_bad_window_cont {
             ($err:expr) => {
@@ -341,7 +352,11 @@ impl XState {
         }
 
         let mut ignored_windows = Vec::new();
-        while let Some(event) = self.connection.poll_for_event().unwrap() {
+        while let Some(event) = self
+            .queued_event
+            .take()
+            .or_else(|| self.connection.poll_for_event().unwrap())
+        {
             trace!("x11 event: {event:?}");
 
             if self.handle_selection_event(&event, server_state) {
@@ -537,6 +552,15 @@ impl XState {
                 };
                 server_state.set_window_serial(e.window(), [data[0], data[1]]);
             }
+            x if x == self.atoms.wm_change_state => {
+                // ICCCM clients (including Electron and Qt on X11) request
+                // minimization with a 32-bit WM_CHANGE_STATE/IconicState.
+                if let x::ClientMessageData::Data32(data) = e.data() {
+                    if data[0] == WmState::Iconic as u32 {
+                        server_state.minimize_window(e.window());
+                    }
+                }
+            }
             x if x == self.atoms.net_wm_state => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
                     unreachable!();
@@ -550,6 +574,13 @@ impl XState {
 
                 trace!("_NET_WM_STATE ({action:?}) props: {prop1:?} {prop2:?}");
 
+                // Both EWMH axes represent one Wayland maximize request.
+                // Process once so a pair of TOGGLE atoms cannot cancel itself.
+                if [prop1, prop2].iter().any(|prop| {
+                    *prop == self.atoms.wm_maximized_horz || *prop == self.atoms.wm_maximized_vert
+                }) {
+                    server_state.set_maximized(e.window(), action);
+                }
                 for prop in [prop1, prop2] {
                     match prop {
                         x if x == self.atoms.wm_fullscreen => {
@@ -573,9 +604,12 @@ impl XState {
                     return;
                 };
                 let button = data[3];
-                // XXX: This can technically be driven by keyboard events and other mouse buttons as well,
-                // but I haven't found an application that does this yet. We'll cross that bridge when we get to it.
-                if button != 1 {
+                // EWMH only recommends specifying the initiating button. Some
+                // clients (e.g. QQ/Electron) use 0 for an unspecified button.
+                // Both paths still require this window's real Wayland left-click
+                // serial in move_window/resize_window; the compositor validates
+                // the active grab. Do not invent a serial or accept other buttons.
+                if !matches!(button, 0 | 1) {
                     warn!(
                         "Attempted move/resize of {:?} with non left click button ({button})",
                         e.window()
@@ -896,12 +930,15 @@ xcb::atoms_struct! {
         wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
         wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
         wm_state => b"WM_STATE" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         wm_s0 => b"WM_S0" only_if_exists = false,
         net_wm_cm_s0 => b"_NET_WM_CM_S0" only_if_exists = false,
         wm_check => b"_NET_SUPPORTING_WM_CHECK" only_if_exists = false,
         net_wm_name => b"_NET_WM_NAME" only_if_exists = false,
         wm_pid => b"_NET_WM_PID" only_if_exists = false,
         net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
+        wm_maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
@@ -1350,11 +1387,18 @@ impl XConnection for RealConnection {
     }
 
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
-        let data = if fullscreen {
-            std::slice::from_ref(&self.atoms.wm_fullscreen)
-        } else {
-            &[]
-        };
+        self.set_toplevel_state(window, fullscreen, false);
+    }
+
+    fn set_toplevel_state(&mut self, window: x::Window, fullscreen: bool, maximized: bool) {
+        let mut states = Vec::new();
+        if fullscreen {
+            states.push(self.atoms.wm_fullscreen);
+        }
+        if maximized {
+            states.extend([self.atoms.wm_maximized_horz, self.atoms.wm_maximized_vert]);
+        }
+        let data = states.as_slice();
 
         if let Err(e) = self
             .connection

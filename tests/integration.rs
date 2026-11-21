@@ -1,7 +1,7 @@
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::process::{Pid, Signal, WaitOptions};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -1250,7 +1250,9 @@ fn copy_from_wayland() {
 
 #[test]
 fn incr_copy_from_wayland() {
-    const BYTES: usize = 3000;
+    // Larger than a pipe's capacity: a blocking receive would deadlock the
+    // compositor dispatching this writer and satellite's main event loop.
+    const BYTES: usize = 256 * 1024;
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
@@ -2272,8 +2274,7 @@ fn rotated_output() {
 
 const BTN_LEFT: u32 = 0x110;
 
-#[test]
-fn client_init_move() {
+fn client_init_move_with_button(button: u32) {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
@@ -2290,16 +2291,26 @@ fn client_init_move() {
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
         connection.atoms.moveresize,
-        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), 1, 0]),
+        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), button, 0]),
     ));
 
     f.wait_and_dispatch();
     let data = f.testwl.get_surface_data(surface).unwrap();
     assert!(data.moving);
+    assert_eq!(data.move_resize_serial, Some(10));
 }
 
 #[test]
-fn client_init_resize() {
+fn client_init_move() {
+    client_init_move_with_button(1);
+}
+
+#[test]
+fn client_init_move_unspecified_button() {
+    client_init_move_with_button(0);
+}
+
+fn client_init_resize_with_button(button: u32) {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
@@ -2316,7 +2327,13 @@ fn client_init_resize() {
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
         connection.atoms.moveresize,
-        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::SizeBottomRight.into(), 1, 0]),
+        x::ClientMessageData::Data32([
+            0,
+            0,
+            MoveResizeDirection::SizeBottomRight.into(),
+            button,
+            0,
+        ]),
     ));
 
     f.wait_and_dispatch();
@@ -2326,4 +2343,352 @@ fn client_init_resize() {
         "Got wrong resizing edge: {:?}",
         data.resizing
     );
+    assert_eq!(data.move_resize_serial, Some(10));
+}
+
+#[test]
+fn client_init_resize() {
+    client_init_resize_with_button(1);
+}
+
+#[test]
+fn client_init_resize_unspecified_button() {
+    client_init_resize_with_button(0);
+}
+
+#[test]
+fn client_init_move_resize_rejects_unsupported_input() {
+    use MoveResizeDirection::*;
+    let cases = [
+        (2, Move, Some(BTN_LEFT)),
+        (3, SizeBottomRight, Some(BTN_LEFT)),
+        (7, Move, Some(BTN_LEFT)),
+        (0, MoveKeyboard, Some(BTN_LEFT)),
+        (0, SizeKeyboard, Some(BTN_LEFT)),
+        (0, Cancel, Some(BTN_LEFT)),
+        (0, Move, None),
+        (0, SizeBottomRight, None),
+        (0, Move, Some(0x112)),
+        (0, SizeBottomRight, Some(0x112)),
+    ];
+    for (button, direction, physical_button) in cases {
+        let mut f = Fixture::new();
+        let mut connection = Connection::new(&f.display);
+        let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+        let surface = f.map_as_toplevel(&mut connection, window);
+        f.testwl.move_pointer_to(surface, 10., 10.);
+        if let Some(physical_button) = physical_button {
+            f.testwl
+                .pointer()
+                .button(10, 20, physical_button, wl_pointer::ButtonState::Pressed);
+            f.testwl.pointer().frame();
+        }
+        f.testwl.dispatch();
+        connection.send_client_message(&x::ClientMessageEvent::new(
+            window,
+            connection.atoms.moveresize,
+            x::ClientMessageData::Data32([0, 0, direction.into(), button, 0]),
+        ));
+        // Rejected requests produce no compositor event. A subsequent mapped
+        // window is a roundtrip barrier proving the request was processed.
+        let barrier = connection.new_window(connection.root, 1, 1, 20, 20, false);
+        f.map_as_toplevel(&mut connection, barrier);
+        let data = f.testwl.get_surface_data(surface).unwrap();
+        assert!(
+            !data.moving,
+            "accepted button={button}, direction={direction:?}, physical={physical_button:?}"
+        );
+        assert!(data.resizing.is_none());
+        assert_eq!(data.move_resize_serial, None);
+    }
+}
+
+fn stalled_wayland_transfer(primary: bool) {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, window);
+    f.testwl.hold_selection_receives(true);
+    let offer = vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: b"complete".to_vec(),
+    }];
+    if primary {
+        f.testwl.create_primary_offer(offer);
+    } else {
+        f.testwl.create_data_offer(offer);
+    }
+    let selection = if primary {
+        connection.atoms.primary
+    } else {
+        connection.atoms.clipboard
+    };
+    let owner_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        f.testwl.dispatch();
+        if connection
+            .get_reply(&x::GetSelectionOwner { selection })
+            .owner()
+            == connection.wm_window
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < owner_deadline,
+            "Wayland selection was not advertised to X11"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let target = connection
+        .get_reply(&x::InternAtom {
+            only_if_exists: false,
+            name: b"text/plain",
+        })
+        .atom();
+    let property = connection
+        .get_reply(&x::InternAtom {
+            only_if_exists: false,
+            name: b"stalled-transfer",
+        })
+        .atom();
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection,
+            target,
+            property,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+    f.wait_and_dispatch();
+    let mut held = f.testwl.take_selection_receives();
+    assert_eq!(held.len(), 1);
+    let mut writer = testwl::TransferFd::from(held.pop().unwrap().1);
+    // Keep an empty writer open first. A completely unrelated new window must
+    // map/configure while the selection is still pending.
+    let second = connection.new_window(connection.root, 1, 1, 30, 30, false);
+    let start = Instant::now();
+    f.map_as_toplevel(&mut connection, second);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    // Partial bytes without EOF must not be reported as successful clipboard data.
+    writer.write_all(b"partial").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let notify = loop {
+        if let Some(xcb::Event::X(x::Event::SelectionNotify(notify))) =
+            connection.poll_for_event().unwrap()
+        {
+            break notify;
+        }
+        assert!(Instant::now() < deadline, "selection did not time out");
+        f.testwl.dispatch();
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(notify.property(), x::ATOM_NONE);
+    assert_eq!(notify.selection(), selection);
+    assert_eq!(notify.target(), target);
+    drop(writer);
+    // Failure/EOF must not disconnect Xwayland or poison subsequent requests.
+    let third = connection.new_window(connection.root, 2, 2, 30, 30, false);
+    f.map_as_toplevel(&mut connection, third);
+    f.testwl.hold_selection_receives(false);
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection,
+            target,
+            property,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+    f.wait_and_dispatch();
+    let notify = connection.await_selection_notify();
+    assert_eq!(notify.property(), property);
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: true,
+        window,
+        property,
+        r#type: target,
+        long_offset: 0,
+        long_length: 20,
+    });
+    assert_eq!(reply.value::<u8>(), b"complete");
+}
+
+#[test]
+fn stalled_wayland_clipboard_does_not_block_windows_and_times_out() {
+    stalled_wayland_transfer(false);
+}
+
+#[test]
+fn stalled_wayland_primary_does_not_block_windows_and_times_out() {
+    stalled_wayland_transfer(true);
+}
+
+fn offer_x11_text(f: &mut Fixture, connection: &mut Connection, window: x::Window) {
+    connection.set_selection_owner(window, connection.atoms.clipboard);
+    let targets = connection.await_selection_request();
+    assert_eq!(targets.target(), connection.atoms.targets);
+    connection.set_property(
+        targets.requestor(),
+        x::ATOM_ATOM,
+        targets.property(),
+        &[connection.atoms.mime1],
+    );
+    connection.send_selection_notify(&targets);
+    f.wait_and_dispatch();
+}
+
+fn nonblocking_reader(fd: OwnedFd) -> std::fs::File {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    fcntl_setfl(&fd, fcntl_getfl(&fd).unwrap() | OFlags::NONBLOCK).unwrap();
+    std::fs::File::from(fd)
+}
+
+fn read_paste(f: &mut Fixture, reader: &mut std::fs::File) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut buffer = [0; 64 * 1024];
+        match reader.read(&mut buffer) {
+            Ok(0) => return bytes,
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("{e}"),
+        }
+        assert!(Instant::now() < deadline, "paste did not finish");
+        f.testwl.dispatch();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn x11_slow_reader_does_not_block_windows() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, window);
+    offer_x11_text(&mut f, &mut connection, window);
+    let mut reader = nonblocking_reader(f.testwl.begin_selection_paste(false, "text/plain"));
+    let request = connection.await_selection_request();
+    let expected: Vec<u8> = (0..1024 * 1024).map(|n| n as u8).collect();
+    connection.set_property(
+        request.requestor(),
+        request.target(),
+        request.property(),
+        &expected,
+    );
+    connection.send_selection_notify(&request);
+    // The data exceeds pipe capacity and the reader is intentionally idle.
+    let second = connection.new_window(connection.root, 2, 2, 30, 30, false);
+    let start = Instant::now();
+    f.map_as_toplevel(&mut connection, second);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(read_paste(&mut f, &mut reader), expected);
+}
+
+#[test]
+fn late_x11_replies_do_not_corrupt_next_same_target_conversion() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, window);
+    offer_x11_text(&mut f, &mut connection, window);
+    let mut expired_reader =
+        nonblocking_reader(f.testwl.begin_selection_paste(false, "text/plain"));
+    let old = connection.await_selection_request();
+    let mut next_reader = nonblocking_reader(f.testwl.begin_selection_paste(false, "text/plain"));
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let next = loop {
+        if let Some(xcb::Event::X(x::Event::SelectionRequest(request))) =
+            connection.poll_for_event().unwrap()
+        {
+            break request;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "FIFO did not advance after timeout"
+        );
+        f.testwl.dispatch();
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_ne!(old.requestor(), next.requestor());
+    assert_eq!(old.target(), next.target());
+    assert!(read_paste(&mut f, &mut expired_reader).is_empty());
+    // Route synthetic late events through a still-live window, as if they had
+    // already been queued by the X server before the old requestor was destroyed.
+    for property in [x::ATOM_NONE, old.property()] {
+        connection
+            .send_and_check_request(&x::SendEvent {
+                propagate: false,
+                destination: x::SendEventDest::Window(connection.wm_window),
+                event_mask: x::EventMask::empty(),
+                event: &x::SelectionNotifyEvent::new(
+                    old.time(),
+                    old.requestor(),
+                    old.selection(),
+                    old.target(),
+                    property,
+                ),
+            })
+            .unwrap();
+    }
+    let second = connection.new_window(connection.root, 2, 2, 30, 30, false);
+    f.map_as_toplevel(&mut connection, second);
+    connection.set_property(
+        next.requestor(),
+        next.target(),
+        next.property(),
+        b"new request survives",
+    );
+    connection.send_selection_notify(&next);
+    assert_eq!(
+        read_paste(&mut f, &mut next_reader),
+        b"new request survives"
+    );
+}
+
+#[test]
+fn primary_owner_destroy_does_not_clear_clipboard() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, window);
+    connection.get_selection_owner_change_events(true, window);
+    f.testwl.create_data_offer(vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: b"clipboard intact".to_vec(),
+    }]);
+    connection.await_selection_owner_change();
+    connection.get_selection_owner_change_events(false, window);
+    let owner = connection.new_window(connection.root, 0, 0, 1, 1, false);
+    connection.set_selection_owner(owner, connection.atoms.primary);
+    let primary_request = connection.await_selection_request();
+    assert_eq!(primary_request.selection(), connection.atoms.primary);
+    connection.destroy_window(owner);
+    let target = connection
+        .get_reply(&x::InternAtom {
+            only_if_exists: true,
+            name: b"text/plain",
+        })
+        .atom();
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection: connection.atoms.clipboard,
+            target,
+            property: target,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+    f.wait_and_dispatch();
+    assert_eq!(connection.await_selection_notify().property(), target);
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: true,
+        window,
+        property: target,
+        r#type: target,
+        long_offset: 0,
+        long_length: 20,
+    });
+    assert_eq!(reply.value::<u8>(), b"clipboard intact");
 }
