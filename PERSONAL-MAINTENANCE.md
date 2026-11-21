@@ -10,6 +10,8 @@ desktop (CachyOS, NVIDIA, niri at 200% scale).
 | `official` | https://github.com/Supreeeme/xwayland-satellite.git (upstream) |
 | `origin` | https://github.com/statnixlab/xwayland-satellite.git (personal fork; push here) |
 | `machine/nvidia-desktop` | Personal patches; what the installed binaries are built from |
+| `machine/nvidia-desktop-wechat` | `machine/nvidia-desktop` + WeChat-only commits |
+| `machine/nvidia-desktop-wps` | `machine/nvidia-desktop` + WPS-only commits |
 | `review/official-YYYYMMDD` | A rebase onto newer upstream, built and tested before adoption |
 
 ## Patch stack (oldest first, on top of `official/main`)
@@ -29,13 +31,28 @@ Upstream's own fix for X11 events buffered during synchronous replies
 Each commit builds and passes the test suite on its own. Keep one feature per
 commit; drop a commit once upstream has an equivalent.
 
+## Application branches
+
+Shared fixes go on `machine/nvidia-desktop`; a commit that only one application
+needs goes on that application's branch, which is always rebased on the shared
+branch.
+
+| Branch | Extra commits |
+| --- | --- |
+| `machine/nvidia-desktop-wechat` | Acknowledge X11 minimize with ICCCM IconicState (Qt repeated minimize); file-only clipboard view for `XWS_FILE_CLIPBOARD_EXE` |
+| `machine/nvidia-desktop-wps` | niri client-maximize-to-column adapter (`XWS_CLIENT_MAXIMIZE_TO_COLUMN=1`); WPS selection toolbar as a popup |
+
+The pre-branch single patches are kept as tags `archive/{chat,wechat,wps}-patch-20261121`
+(all on upstream 0.8.2).
+
 ## Installed binaries
 
-| Binary | Display / service | Users |
-| --- | --- | --- |
-| `~/.local/libexec/xwayland-satellite-hidpi` | `:2` xwayland-chat.service | QQ, AB Download Manager |
-| `~/.local/libexec/xwayland-satellite-steam` | `:5` xwayland-steam.service | Steam |
-| `~/.local/libexec/xwayland-satellite-wechat` / `-wps` | `:4` / `:3` | separate patches in desktop-config |
+| Binary | Branch | Display / service | Users |
+| --- | --- | --- | --- |
+| `~/.local/libexec/xwayland-satellite-hidpi` | `machine/nvidia-desktop` | `:2` xwayland-chat.service | QQ, AB Download Manager |
+| `~/.local/libexec/xwayland-satellite-steam` | `machine/nvidia-desktop` | `:5` xwayland-steam.service | Steam |
+| `~/.local/libexec/xwayland-satellite-wechat` | `machine/nvidia-desktop-wechat` | `:4` xwayland-wechat.service | WeChat |
+| `~/.local/libexec/xwayland-satellite-wps` | `machine/nvidia-desktop-wps` | `:3` xwayland-wps.service | WPS |
 
 ## Updating to newer upstream
 
@@ -52,5 +69,13 @@ only the affected service. Restarting `xwayland-chat.service` disconnects QQ:
 quit it first. When satisfied, move `machine/nvidia-desktop` to the review branch
 (`git branch -f machine/nvidia-desktop review/...`), keeping the old tip as a tag
 `archive/nvidia-desktop-YYYYMMDD`.
+Then rebase each application branch onto the new shared branch:
+
+```sh
+git rebase --onto machine/nvidia-desktop <old shared tip> machine/nvidia-desktop-wechat
+git rebase --onto machine/nvidia-desktop <old shared tip> machine/nvidia-desktop-wps
+```
+
+and build/test each before installing its binary.
 Push the archive tag first, then the branch with `--force-with-lease`, then
 update `desktop-config/system-reference/xwayland-satellite/source.json`.
