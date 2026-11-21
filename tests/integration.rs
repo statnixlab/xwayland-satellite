@@ -2511,8 +2511,7 @@ fn rotated_output() {
 
 const BTN_LEFT: u32 = 0x110;
 
-#[test]
-fn client_init_move() {
+fn client_init_move_with_button(button: u32) {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
@@ -2533,16 +2532,26 @@ fn client_init_move() {
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
         connection.atoms.moveresize,
-        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), 1, 0]),
+        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), button, 0]),
     ));
 
     f.wait_and_dispatch();
     let data = f.testwl.get_surface_data(surface).unwrap();
     assert!(data.moving);
+    assert_eq!(data.move_resize_serial, Some(10));
 }
 
 #[test]
-fn client_init_resize() {
+fn client_init_move() {
+    client_init_move_with_button(1);
+}
+
+#[test]
+fn client_init_move_unspecified_button() {
+    client_init_move_with_button(0);
+}
+
+fn client_init_resize_with_button(button: u32) {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
@@ -2563,7 +2572,13 @@ fn client_init_resize() {
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
         connection.atoms.moveresize,
-        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::SizeBottomRight.into(), 1, 0]),
+        x::ClientMessageData::Data32([
+            0,
+            0,
+            MoveResizeDirection::SizeBottomRight.into(),
+            button,
+            0,
+        ]),
     ));
 
     f.wait_and_dispatch();
@@ -2573,4 +2588,62 @@ fn client_init_resize() {
         "Got wrong resizing edge: {:?}",
         data.resizing
     );
+    assert_eq!(data.move_resize_serial, Some(10));
+}
+
+#[test]
+fn client_init_resize() {
+    client_init_resize_with_button(1);
+}
+
+#[test]
+fn client_init_resize_unspecified_button() {
+    client_init_resize_with_button(0);
+}
+
+#[test]
+fn client_init_move_resize_rejects_unsupported_input() {
+    use MoveResizeDirection::*;
+    let cases = [
+        (2, Move, Some(BTN_LEFT)),
+        (3, SizeBottomRight, Some(BTN_LEFT)),
+        (7, Move, Some(BTN_LEFT)),
+        (0, MoveKeyboard, Some(BTN_LEFT)),
+        (0, SizeKeyboard, Some(BTN_LEFT)),
+        (0, Cancel, Some(BTN_LEFT)),
+        (0, Move, None),
+        (0, SizeBottomRight, None),
+        (0, Move, Some(0x112)),
+        (0, SizeBottomRight, Some(0x112)),
+    ];
+    for (button, direction, physical_button) in cases {
+        let mut f = Fixture::new();
+        let mut connection = Connection::new(&f.display);
+        let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+        let surface = f.map_as_toplevel(&mut connection, window);
+        f.testwl.move_pointer_to(surface, 10., 10.);
+        if let Some(physical_button) = physical_button {
+            f.testwl
+                .pointer()
+                .button(10, 20, physical_button, wl_pointer::ButtonState::Pressed);
+            f.testwl.pointer().frame();
+        }
+        f.testwl.dispatch();
+        connection.send_client_message(&x::ClientMessageEvent::new(
+            window,
+            connection.atoms.moveresize,
+            x::ClientMessageData::Data32([0, 0, direction.into(), button, 0]),
+        ));
+        // Rejected requests produce no compositor event. A subsequent mapped
+        // window is a roundtrip barrier proving the request was processed.
+        let barrier = connection.new_window(connection.root, 1, 1, 20, 20, false);
+        f.map_as_toplevel(&mut connection, barrier);
+        let data = f.testwl.get_surface_data(surface).unwrap();
+        assert!(
+            !data.moving,
+            "accepted button={button}, direction={direction:?}, physical={physical_button:?}"
+        );
+        assert!(data.resizing.is_none());
+        assert_eq!(data.move_resize_serial, None);
+    }
 }

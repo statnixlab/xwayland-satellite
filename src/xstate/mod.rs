@@ -600,9 +600,12 @@ impl XState {
                     return;
                 };
                 let button = data[3];
-                // XXX: This can technically be driven by keyboard events and other mouse buttons as well,
-                // but I haven't found an application that does this yet. We'll cross that bridge when we get to it.
-                if button != 1 {
+                // EWMH only recommends specifying the initiating button. Some
+                // clients (e.g. QQ/Electron) use 0 for an unspecified button.
+                // Both paths still require this window's real Wayland left-click
+                // serial in move_window/resize_window; the compositor validates
+                // the active grab. Do not invent a serial or accept other buttons.
+                if !matches!(button, 0 | 1) {
                     warn!(
                         "Attempted move/resize of {:?} with non left click button ({button})",
                         e.window()

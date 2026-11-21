@@ -117,6 +117,7 @@ pub struct SurfaceData {
     pub fractional: Option<WpFractionalScaleV1>,
     pub viewport: Option<Viewport>,
     pub moving: bool,
+    pub move_resize_serial: Option<u32>,
     pub resizing: Option<xdg_toplevel::ResizeEdge>,
 }
 
@@ -1655,20 +1656,24 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 };
                 toplevel.parent = parent;
             }
-            xdg_toplevel::Request::Move { seat: _, serial: _ } => {
+            xdg_toplevel::Request::Move { seat, serial } => {
+                assert_eq!(Some(seat), state.seat);
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 data.moving = true;
+                data.move_resize_serial = Some(serial);
             }
             xdg_toplevel::Request::Resize {
-                seat: _,
-                serial: _,
+                seat,
+                serial,
                 edges,
             } => {
+                assert_eq!(Some(seat), state.seat);
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 let WEnum::Value(edge) = edges else {
                     unreachable!()
                 };
                 data.resizing = Some(edge);
+                data.move_resize_serial = Some(serial);
             }
             other => todo!("unhandled request {other:?}"),
         }
@@ -2004,6 +2009,7 @@ impl Dispatch<WlCompositor, ()> for State {
                         fractional: None,
                         viewport: None,
                         moving: false,
+                        move_resize_serial: None,
                         resizing: None,
                     },
                 );
