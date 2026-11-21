@@ -163,6 +163,7 @@ struct FakeXConnection {
     send_take_focus_window: Option<Window>,
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
+    maximized: HashMap<Window, bool>,
 }
 
 impl FakeXConnection {
@@ -212,6 +213,12 @@ impl super::XConnection for FakeXConnection {
     #[track_caller]
     fn set_fullscreen(&mut self, window: xcb::x::Window, fullscreen: bool) {
         self.window_mut(window).fullscreen = fullscreen;
+    }
+
+    fn set_toplevel_state(&mut self, window: Window, fullscreen: bool, maximized: bool) {
+        let data = self.window_mut(window);
+        data.fullscreen = fullscreen;
+        self.maximized.insert(window, maximized);
     }
 
     #[track_caller]
@@ -1332,6 +1339,35 @@ fn maximized() {
             .states
             .contains(&xdg_toplevel::State::Maximized)
     );
+}
+
+// WPS emits two identical messages for each click. The custom Niri mode
+// toggles on set_maximized and sends configure without the Maximized state.
+#[test]
+fn column_maximized_duplicate_wps_requests() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+    {
+        let entity = f.satellite.windows[&win];
+        let mut role = f.satellite.world.get::<&mut super::SurfaceRole>(entity).unwrap();
+        let super::SurfaceRole::Toplevel(Some(toplevel)) = &mut *role else { panic!() };
+        toplevel.column_maximized = Some(false);
+    }
+    for (action, expected) in [(SetState::Add, true), (SetState::Remove, false), (SetState::Add, true)] {
+        f.satellite.set_maximized(win, action);
+        f.satellite.set_maximized(win, action);
+        f.run();
+        f.run();
+        // The fixture records one Maximized entry per set_maximized request.
+        // Even REMOVE must forward one set request for Niri's toggle protocol.
+        assert_eq!(f.testwl.get_surface_data(id).unwrap().toplevel().states
+            .iter().filter(|s| **s == xdg_toplevel::State::Maximized).count(), 1);
+        f.testwl.configure_toplevel(id, 900, 700, vec![]);
+        f.run();
+        f.run();
+        assert_eq!(f.connection().maximized.get(&win), Some(&expected));
+    }
 }
 
 #[test]

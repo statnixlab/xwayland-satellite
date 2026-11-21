@@ -241,6 +241,9 @@ struct ToplevelData {
     xdg: XdgSurfaceData,
     fullscreen: bool,
     maximized: bool,
+    // Opt-in adapter for this desktop's client-maximize-to-column Niri patch.
+    // Niri treats set_maximized as a toggle and does not advertise Maximized.
+    column_maximized: Option<bool>,
     decoration: decoration::DecorationsData,
 }
 
@@ -1250,17 +1253,32 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         };
 
-        let Some(role) = data.get::<&SurfaceRole>() else {
+        let Some(mut role) = data.get::<&mut SurfaceRole>() else {
             warn!("Tried to set window without role maximized: {window:?}");
             return;
         };
 
-        let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
+        let SurfaceRole::Toplevel(Some(toplevel)) = &mut *role else {
             warn!("Tried to set an unmapped toplevel or non toplevel maximized: {window:?}");
             return;
         };
 
         use crate::xstate::SetState;
+        if let Some(current) = toplevel.column_maximized.as_mut() {
+            let next = match state {
+                SetState::Add => true,
+                SetState::Remove => false,
+                SetState::Toggle => !*current,
+            };
+            if next != *current {
+                *current = next;
+                // Both transitions must use the custom compositor's toggle request.
+                // Remember immediately: WPS sends duplicate ADD/REMOVE messages
+                // before the compositor can respond with a configure.
+                toplevel.toplevel.set_maximized();
+            }
+            return;
+        }
         match state {
             SetState::Add => toplevel.toplevel.set_maximized(),
             SetState::Remove => toplevel.toplevel.unset_maximized(),
@@ -1671,6 +1689,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             toplevel,
             fullscreen: false,
             maximized: false,
+            column_maximized: (std::env::var("XWS_CLIENT_MAXIMIZE_TO_COLUMN").as_deref()
+                == Ok("1"))
+                .then_some(false),
             decoration: DecorationsData {
                 wl: wl_decoration,
                 satellite: sat_decoration,
