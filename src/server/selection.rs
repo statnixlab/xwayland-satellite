@@ -1,6 +1,6 @@
 use super::clientside::SelectionEvents;
-use super::{InnerServerState, MyWorld, ServerState};
-use crate::{X11Selection, XConnection};
+use super::{InnerServerState, MyWorld};
+use crate::X11Selection;
 use log::{info, warn};
 use smithay_client_toolkit::data_device_manager::ReadPipe;
 use wayland_client::globals::GlobalList;
@@ -15,7 +15,6 @@ use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
 use smithay_client_toolkit::primary_selection::device::PrimarySelectionDevice;
 use smithay_client_toolkit::primary_selection::offer::PrimarySelectionOffer;
 use smithay_client_toolkit::primary_selection::selection::PrimarySelectionSource;
-use std::io::Read;
 use std::rc::{Rc, Weak};
 
 pub(super) struct SelectionStates<S: X11Selection> {
@@ -153,16 +152,10 @@ pub struct ForeignSelection<T: SelectionType> {
 
 #[allow(private_bounds)]
 impl<T: SelectionType> ForeignSelection<T> {
-    pub(crate) fn receive(
-        &self,
-        mime_type: String,
-        state: &ServerState<impl XConnection>,
-    ) -> Vec<u8> {
-        let mut pipe = T::receive_offer(&self.inner, mime_type).unwrap();
-        state.queue.flush().unwrap();
-        let mut data = Vec::new();
-        pipe.read_to_end(&mut data).unwrap();
-        data
+    /// Request the transfer without waiting for its producer. The main loop flushes
+    /// the Wayland queue and drives the returned pipe asynchronously.
+    pub(crate) fn receive(&self, mime_type: String) -> std::io::Result<ReadPipe> {
+        T::receive_offer(&self.inner, mime_type)
     }
 }
 

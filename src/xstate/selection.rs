@@ -1,13 +1,15 @@
 use super::{XState, get_atom_name};
 use crate::server::selection::{Clipboard, ForeignSelection, Primary, SelectionType};
+use crate::transfer::{IO_BUDGET, ReadTransfer, TRANSFER_TIMEOUT, nonblocking};
 use crate::{RealServerState, X11Selection};
 use log::{debug, error, warn};
-use rustix::event::{PollFd, PollFlags, poll};
-use smithay_client_toolkit::data_device_manager::WritePipe;
+use smithay_client_toolkit::data_device_manager::{ReadPipe, WritePipe};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{Error, ErrorKind, Result, Write};
+use std::io::{ErrorKind, Write};
 use std::rc::Rc;
+use std::task::Poll;
+use std::time::Instant;
 use xcb::x;
 
 #[derive(Debug)]
@@ -24,6 +26,10 @@ struct PendingSelectionData {
     pipe: WritePipe,
     incr: bool,
     active: bool,
+    requestor: x::Window,
+    buffer: Option<Vec<u8>>,
+    written: usize,
+    deadline: Instant,
 }
 
 pub struct Selection {
@@ -45,6 +51,10 @@ impl X11Selection for Selection {
     }
 
     fn write_to(&self, mime: &str, pipe: WritePipe) {
+        if let Err(error) = nonblocking(&pipe) {
+            warn!("Cannot make selection destination nonblocking: {error}");
+            return;
+        }
         if let Some(target) = self.mimes.iter().find(|target| target.name == mime) {
             // A lot of X applications do not anticipate the possibility of multiple requests for
             // its owned selection to need the INCR transfer mechanism and will stop sending the
@@ -58,6 +68,10 @@ impl X11Selection for Selection {
                 pipe,
                 incr: false,
                 active: false,
+                requestor: x::WINDOW_NONE,
+                buffer: None,
+                written: 0,
+                deadline: Instant::now() + TRANSFER_TIMEOUT,
             });
             if self.pending.borrow().len() == 1 {
                 self.next_conversion();
@@ -80,47 +94,86 @@ impl Selection {
     fn next_conversion(&self) {
         let mut pending = self.pending.borrow_mut();
         if pending.front().is_some_and(|p| p.active) {
-            pending.pop_front();
+            let finished = pending.pop_front().unwrap();
+            self.connection.send_request(&x::DestroyWindow {
+                window: finished.requestor,
+            });
         }
 
         while let Some(psd) = pending.front_mut() {
-            if let Err(e) = self
+            // A separate requestor is the conversion's identity. Reusing one
+            // window after timeout lets a late same-target reply corrupt the
+            // next FIFO entry, even when property/time are checked.
+            let requestor = self.connection.generate_id();
+            let result = self.connection.send_and_check_request(&x::CreateWindow {
+                wid: requestor,
+                parent: self.window,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                depth: 0,
+                border_width: 0,
+                class: x::WindowClass::InputOnly,
+                visual: x::COPY_FROM_PARENT,
+                value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
+            });
+            if let Err(error) = result {
+                warn!("Cannot create selection request window: {error}");
+                pending.pop_front();
+                continue;
+            }
+            psd.requestor = requestor;
+            if let Err(error) = self
                 .connection
                 .send_and_check_request(&x::ConvertSelection {
-                    requestor: self.window,
+                    requestor,
                     selection: self.selection,
                     target: psd.target,
                     property: psd.property,
                     time: self.selection_time,
                 })
             {
-                error!(
-                    "Failed to request selection data (target: {}, error: {e})",
-                    get_atom_name(&self.connection, psd.target),
-                );
+                warn!("Failed to request selection data: {error}");
+                self.connection
+                    .send_request(&x::DestroyWindow { window: requestor });
                 pending.pop_front();
             } else {
                 psd.active = true;
+                psd.deadline = Instant::now() + TRANSFER_TIMEOUT;
                 break;
             }
         }
+        self.connection.flush().ok();
     }
 
-    fn handle_notify(&self, target: x::Atom) {
+    fn handle_refused_notify(&self, requestor: x::Window, target: x::Atom, time: u32) {
+        if time == self.selection_time
+            && self
+                .pending
+                .borrow()
+                .front()
+                .is_some_and(|p| p.active && p.requestor == requestor && p.target == target)
+        {
+            self.next_conversion();
+        }
+    }
+
+    fn handle_notify(&self, target: x::Atom, requestor: x::Window, property: x::Atom) {
         let mut pending = self.pending.borrow_mut();
-        let Some(psd) = pending.front_mut().filter(|t| t.target == target) else {
+        let Some(psd) = pending.front_mut().filter(|p| {
+            p.active && p.target == target && p.requestor == requestor && p.property == property
+        }) else {
             warn!(
                 "Got selection notify for unexpected target {}",
                 get_atom_name(&self.connection, target),
             );
-            drop(pending);
-            self.next_conversion();
             return;
         };
 
         let request = self.connection.send_request(&x::GetProperty {
-            delete: true,
-            window: self.window,
+            delete: false,
+            window: psd.requestor,
             property: psd.property,
             r#type: x::ATOM_ANY,
             long_offset: 0,
@@ -151,6 +204,12 @@ impl Selection {
                 get_atom_name(&self.connection, psd.property)
             );
             psd.incr = true;
+            psd.deadline = Instant::now() + TRANSFER_TIMEOUT;
+            self.connection.send_request(&x::DeleteProperty {
+                window: psd.requestor,
+                property: psd.property,
+            });
+            self.connection.flush().ok();
             return;
         }
 
@@ -165,57 +224,78 @@ impl Selection {
             }
         };
 
-        // Since the WritePipe given to us can have the O_NONBLOCK flag, we must respect that and
-        // use `select` to monitor when the pipe is available to do more I/O.
-        fn write_all(pipe: &mut WritePipe, mut buf: &[u8]) -> Result<()> {
-            while !buf.is_empty() {
-                match pipe.write(buf) {
-                    Ok(0) => return Err(Error::from(ErrorKind::WriteZero)),
-                    Ok(n) => buf = &buf[n..],
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        let mut pollfds = [PollFd::new(pipe, PollFlags::OUT)];
-                        poll(&mut pollfds, None)?;
+        psd.buffer = Some(data.to_vec());
+        psd.written = 0;
+        drop(pending);
+        self.advance_write(Instant::now());
+    }
+
+    fn advance_write(&self, now: Instant) {
+        let mut pending = self.pending.borrow_mut();
+        let Some(psd) = pending.front_mut() else {
+            return;
+        };
+        let mut failed = now >= psd.deadline;
+        if failed {
+            warn!("X11 selection transfer timed out");
+        }
+        if !failed {
+            let Some(buffer) = psd.buffer.as_ref() else {
+                return;
+            };
+            let mut budget = IO_BUDGET;
+            for _ in 0..16 {
+                if psd.written == buffer.len() || budget == 0 {
+                    break;
+                }
+                let end = buffer.len().min(psd.written + budget);
+                match psd.pipe.write(&buffer[psd.written..end]) {
+                    Ok(0) => {
+                        failed = true;
+                        break;
                     }
-                    Err(e) => return Err(e),
+                    Ok(n) => {
+                        psd.written += n;
+                        budget -= n;
+                        psd.deadline = now + TRANSFER_TIMEOUT;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        warn!("Failed to write selection data: {error}");
+                        failed = true;
+                        break;
+                    }
                 }
             }
-            Ok(())
-        }
-
-        if !psd.incr || !data.is_empty() {
-            if let Err(e) = write_all(&mut psd.pipe, data) {
-                warn!("Failed to write selection data: {e:?}");
-            } else if psd.incr {
-                debug!(
-                    "received some incr data for {}",
-                    get_atom_name(&self.connection, psd.target)
-                );
+            if !failed && psd.written < buffer.len() {
                 return;
             }
-        } else if psd.incr {
-            // data is empty
-            debug!(
-                "completed incr for mime {}",
-                get_atom_name(&self.connection, target)
-            );
         }
-
+        self.connection.send_request(&x::DeleteProperty {
+            window: psd.requestor,
+            property: psd.property,
+        });
+        self.connection.flush().ok();
+        if !failed && psd.incr && psd.buffer.as_ref().is_some_and(|b| !b.is_empty()) {
+            psd.buffer = None;
+            psd.written = 0;
+            return;
+        }
         drop(pending);
         self.next_conversion();
     }
 
     fn check_for_incr(&self, event: &x::PropertyNotifyEvent) -> bool {
         debug_assert_eq!(event.state(), x::Property::NewValue);
-        if event.window() != self.window {
-            return false;
-        }
-
         let target = self.pending.borrow().front().and_then(|pending| {
-            (pending.property == event.atom() && pending.incr).then_some(pending.target)
+            (pending.requestor == event.window()
+                && pending.property == event.atom()
+                && pending.incr)
+                .then_some(pending.target)
         });
         if let Some(target) = target {
-            self.handle_notify(target);
+            self.handle_notify(target, event.window(), event.atom());
             true
         } else {
             false
@@ -223,65 +303,99 @@ impl Selection {
     }
 }
 
+impl Drop for Selection {
+    fn drop(&mut self) {
+        for pending in self.pending.get_mut() {
+            if pending.active {
+                self.connection.send_request(&x::DestroyWindow {
+                    window: pending.requestor,
+                });
+            }
+        }
+        self.connection.flush().ok();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelectionReply {
+    time: u32,
+    requestor: x::Window,
+    selection: x::Atom,
+    target: x::Atom,
+    property: x::Atom,
+}
+
+impl SelectionReply {
+    fn from_request(request: &x::SelectionRequestEvent) -> Self {
+        Self {
+            time: request.time(),
+            requestor: request.requestor(),
+            selection: request.selection(),
+            target: request.target(),
+            property: request.property(),
+        }
+    }
+
+    fn notify(&self, connection: &xcb::Connection, success: bool) {
+        if let Err(error) = connection.send_and_check_request(&x::SendEvent {
+            propagate: false,
+            destination: x::SendEventDest::Window(self.requestor),
+            event_mask: x::EventMask::empty(),
+            event: &x::SelectionNotifyEvent::new(
+                self.time,
+                self.requestor,
+                self.selection,
+                self.target,
+                if success { self.property } else { x::ATOM_NONE },
+            ),
+        }) {
+            warn!("Failed to send selection request notify: {error:?}");
+        }
+    }
+}
+
+struct PendingWaylandRead {
+    reply: SelectionReply,
+    transfer: ReadTransfer<ReadPipe>,
+    max_req_bytes: usize,
+}
+
+enum SelectionRequestOutcome {
+    Immediate(bool),
+    Pending(PendingWaylandRead),
+}
+
 pub struct WaylandIncrInfo {
     data: Vec<u8>,
     start: usize,
-    property: x::Atom,
-    target_window: x::Window,
-    target_type: x::Atom,
+    reply: SelectionReply,
     max_req_bytes: usize,
+    deadline: Instant,
 }
 
 pub struct WaylandSelection<T: SelectionType> {
     mimes: Vec<SelectionTargetId>,
     inner: ForeignSelection<T>,
-    incr_data: Option<WaylandIncrInfo>,
 }
 
-impl<T: SelectionType> WaylandSelection<T> {
-    fn check_for_incr(
-        &mut self,
-        event: &x::PropertyNotifyEvent,
-        connection: &xcb::Connection,
-    ) -> bool {
-        let Some(incr_data) = self.incr_data.as_mut() else {
-            return false;
-        };
-        if incr_data.property != event.atom() {
-            return false;
-        }
-
-        let incr_end = std::cmp::min(
-            incr_data.max_req_bytes + incr_data.start,
-            incr_data.data.len(),
-        );
-
-        if let Err(e) = connection.send_and_check_request(&x::ChangeProperty {
+impl WaylandIncrInfo {
+    /// Return true once complete (including a failed/disappeared requestor).
+    fn advance(&mut self, connection: &xcb::Connection) -> bool {
+        let end = std::cmp::min(self.max_req_bytes + self.start, self.data.len());
+        if let Err(error) = connection.send_and_check_request(&x::ChangeProperty {
             mode: x::PropMode::Append,
-            window: incr_data.target_window,
-            property: incr_data.property,
-            r#type: incr_data.target_type,
-            data: &incr_data.data[incr_data.start..incr_end],
+            window: self.reply.requestor,
+            property: self.reply.property,
+            r#type: self.reply.target,
+            data: &self.data[self.start..end],
         }) {
-            warn!("failed to write selection data: {e:?}");
-            self.incr_data = None;
+            warn!("Failed to write incremental selection data: {error:?}");
             return true;
         }
-
-        if incr_data.start == incr_end {
-            debug!(
-                "completed incr for mime {}",
-                get_atom_name(connection, incr_data.target_type)
-            );
-            self.incr_data = None;
-        } else {
-            debug!(
-                "received some incr data for {}",
-                get_atom_name(connection, incr_data.target_type)
-            );
-            incr_data.start = incr_end;
-        }
-        true
+        let finished = self.start == end;
+        self.start = end;
+        self.deadline = Instant::now() + TRANSFER_TIMEOUT;
+        finished
     }
 }
 
@@ -325,7 +439,7 @@ trait SelectionDataImpl {
         request: &x::SelectionRequestEvent,
         max_req_bytes: usize,
         server_state: &mut RealServerState,
-    ) -> bool;
+    ) -> SelectionRequestOutcome;
     fn atom(&self) -> x::Atom;
     fn selection_clear(&mut self);
 }
@@ -337,12 +451,6 @@ impl<T: SelectionType> SelectionData<T> {
             atom,
             targets_atom,
             current_selection: None,
-        }
-    }
-    fn wayland_selection_mut(&mut self) -> Option<&mut WaylandSelection<T>> {
-        match &mut self.current_selection {
-            Some(CurrentSelection::Wayland(sel)) => Some(sel),
-            _ => None,
         }
     }
 }
@@ -527,97 +635,45 @@ impl<T: SelectionType> SelectionDataImpl for SelectionData<T> {
         atoms: &super::Atoms,
         request: &x::SelectionRequestEvent,
         max_req_bytes: usize,
-        server_state: &mut RealServerState,
-    ) -> bool {
-        let Some(CurrentSelection::Wayland(WaylandSelection {
-            mimes,
-            inner,
-            incr_data,
-        })) = &mut self.current_selection
+        _server_state: &mut RealServerState,
+    ) -> SelectionRequestOutcome {
+        use SelectionRequestOutcome::{Immediate, Pending};
+        let Some(CurrentSelection::Wayland(WaylandSelection { mimes, inner })) =
+            &mut self.current_selection
         else {
             warn!("Got selection request, but we don't seem to be the selection owner");
-            return false;
+            return Immediate(false);
         };
-
-        let req_target = request.target();
-        if req_target == atoms.targets {
-            let atoms: Box<[x::Atom]> = mimes.iter().map(|t| t.target).collect();
-
-            match connection.send_and_check_request(&x::ChangeProperty {
-                mode: x::PropMode::Replace,
-                window: request.requestor(),
-                property: request.property(),
-                r#type: x::ATOM_ATOM,
-                data: &atoms,
-            }) {
-                Ok(_) => true,
-                Err(e) => {
-                    warn!("Failed to set targets for selection request: {e:?}");
-                    false
-                }
-            }
-        } else {
-            let Some(target) = mimes.iter().find(|t| t.target == req_target) else {
-                if log::log_enabled!(log::Level::Debug) {
-                    let name = get_atom_name(connection, req_target);
-                    debug!(
-                        "refusing selection request because given atom could not be found ({name})"
-                    );
-                }
-                return false;
-            };
-
-            let mime_name = target
-                .source
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| target.name.clone());
-            let data = inner.receive(mime_name, server_state);
-            if data.len() > max_req_bytes {
-                if let Err(e) = connection.send_and_check_request(&x::ChangeWindowAttributes {
-                    window: request.requestor(),
-                    value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
-                }) {
-                    warn!("Failed to set up property change notifications: {e:?}");
-                    return false;
-                }
-                if let Err(e) = connection.send_and_check_request(&x::ChangeProperty {
-                    mode: x::PropMode::Replace,
-                    window: request.requestor(),
-                    property: request.property(),
-                    r#type: atoms.incr,
-                    data: &[data.len() as u32],
-                }) {
-                    warn!("Failed to set incr property for large transfer: {e:?}");
-                    return false;
-                }
-                debug!(
-                    "beginning incr for {}",
-                    get_atom_name(connection, target.target)
-                );
-                *incr_data = Some(WaylandIncrInfo {
-                    data,
-                    start: 0,
-                    target_window: request.requestor(),
-                    property: request.property(),
-                    target_type: target.target,
-                    max_req_bytes,
-                });
-                true
-            } else {
-                match connection.send_and_check_request(&x::ChangeProperty {
-                    mode: x::PropMode::Replace,
-                    window: request.requestor(),
-                    property: request.property(),
-                    r#type: target.target,
-                    data: &data,
-                }) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        warn!("Failed setting selection property: {e:?}");
-                        false
-                    }
-                }
+        if request.target() == atoms.targets {
+            let targets: Box<[x::Atom]> = mimes.iter().map(|t| t.target).collect();
+            return Immediate(
+                connection
+                    .send_and_check_request(&x::ChangeProperty {
+                        mode: x::PropMode::Replace,
+                        window: request.requestor(),
+                        property: request.property(),
+                        r#type: x::ATOM_ATOM,
+                        data: &targets,
+                    })
+                    .is_ok(),
+            );
+        }
+        let Some(target) = mimes.iter().find(|t| t.target == request.target()) else {
+            return Immediate(false);
+        };
+        let mime = target.source.as_ref().unwrap_or(&target.name).clone();
+        match inner
+            .receive(mime)
+            .and_then(|pipe| ReadTransfer::new(pipe, Instant::now()))
+        {
+            Ok(transfer) => Pending(PendingWaylandRead {
+                reply: SelectionReply::from_request(request),
+                transfer,
+                max_req_bytes,
+            }),
+            Err(error) => {
+                warn!("Failed to start Wayland selection transfer: {error}");
+                Immediate(false)
             }
         }
     }
@@ -627,6 +683,8 @@ pub(super) struct SelectionState {
     clipboard: SelectionData<Clipboard>,
     primary: SelectionData<Primary>,
     target_window: x::Window,
+    pending_reads: Vec<PendingWaylandRead>,
+    incr_data: Vec<WaylandIncrInfo>,
 }
 
 impl SelectionState {
@@ -650,6 +708,8 @@ impl SelectionState {
             .expect("Couldn't create window for selections");
         Self {
             target_window,
+            pending_reads: Vec::new(),
+            incr_data: Vec::new(),
             clipboard: SelectionData::new(atoms.clipboard, atoms.clipboard_targets),
             primary: SelectionData::new(atoms.primary, atoms.primary_targets),
         }
@@ -657,6 +717,89 @@ impl SelectionState {
 }
 
 impl XState {
+    pub(crate) fn has_pending_selection_transfers(&self) -> bool {
+        !self.selection_state.pending_reads.is_empty()
+            || !self.selection_state.incr_data.is_empty()
+            || self
+                .selection_state
+                .clipboard
+                .x11_selection()
+                .is_some_and(|s| !s.pending.borrow().is_empty())
+            || self
+                .selection_state
+                .primary
+                .x11_selection()
+                .is_some_and(|s| !s.pending.borrow().is_empty())
+    }
+
+    pub(crate) fn advance_selection_transfers(&mut self) {
+        let now = Instant::now();
+        for selection in [
+            self.selection_state.clipboard.x11_selection(),
+            self.selection_state.primary.x11_selection(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            selection.advance_write(now);
+        }
+        let mut pending = std::mem::take(&mut self.selection_state.pending_reads);
+        for mut request in pending.drain(..) {
+            match request.transfer.advance(now) {
+                Poll::Pending => self.selection_state.pending_reads.push(request),
+                Poll::Ready(Err(error)) => {
+                    warn!("Wayland selection transfer failed: {error}");
+                    request.reply.notify(&self.connection, false);
+                }
+                Poll::Ready(Ok(data)) => {
+                    let reply = request.reply;
+                    let success = if data.len() > request.max_req_bytes {
+                        let setup = self
+                            .connection
+                            .send_and_check_request(&x::ChangeWindowAttributes {
+                                window: reply.requestor,
+                                value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
+                            })
+                            .and_then(|_| {
+                                self.connection.send_and_check_request(&x::ChangeProperty {
+                                    mode: x::PropMode::Replace,
+                                    window: reply.requestor,
+                                    property: reply.property,
+                                    r#type: self.atoms.incr,
+                                    data: &[data.len() as u32],
+                                })
+                            });
+                        if setup.is_ok() {
+                            self.selection_state.incr_data.push(WaylandIncrInfo {
+                                data,
+                                start: 0,
+                                reply,
+                                max_req_bytes: request.max_req_bytes,
+                                deadline: now + TRANSFER_TIMEOUT,
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        self.connection
+                            .send_and_check_request(&x::ChangeProperty {
+                                mode: x::PropMode::Replace,
+                                window: reply.requestor,
+                                property: reply.property,
+                                r#type: reply.target,
+                                data: &data,
+                            })
+                            .is_ok()
+                    };
+                    reply.notify(&self.connection, success);
+                }
+            }
+        }
+        // An X11 requestor can disappear or stop acknowledging INCR chunks.
+        self.selection_state.incr_data.retain(|p| p.deadline > now);
+    }
+
     fn intern_target_property_atoms(&self, mime: &[u8], suffix: &[u8]) -> (x::Atom, x::Atom) {
         // A concatenation of the target and the selection type are used to create a distinct
         // property to write to
@@ -724,7 +867,6 @@ impl XState {
                 Some(CurrentSelection::Wayland(WaylandSelection {
                     mimes,
                     inner: selection,
-                    incr_data: None,
                 }));
 
             debug!("Clipboard set from Wayland");
@@ -776,7 +918,6 @@ impl XState {
                 Some(CurrentSelection::Wayland(WaylandSelection {
                     mimes,
                     inner: selection,
-                    incr_data: None,
                 }));
             debug!("Primary set from Wayland");
         }
@@ -807,11 +948,9 @@ impl XState {
                 if e.property() == x::ATOM_NONE {
                     // Since the requested conversion could not be made, the request is invalid and
                     // should be removed, dropping the WritePipe to signal no data will be sent
-                    if e.requestor() == self.selection_state.target_window {
-                        let data = get_selection_data!(e.selection());
-                        if let Some(selection) = data.x11_selection() {
-                            selection.next_conversion();
-                        }
+                    let data = get_selection_data!(e.selection());
+                    if let Some(selection) = data.x11_selection() {
+                        selection.handle_refused_notify(e.requestor(), e.target(), e.time());
                     }
                     warn!(
                         "selection notify fail? {}",
@@ -843,38 +982,15 @@ impl XState {
                             get_atom_name(&self.connection, other)
                         ),
                     }
-                } else if e.requestor() == self.selection_state.target_window {
-                    if let Some(selection) = data.x11_selection() {
-                        selection.handle_notify(e.target());
+                } else if let Some(selection) = data.x11_selection() {
+                    if e.time() == selection.selection_time {
+                        selection.handle_notify(e.target(), e.requestor(), e.property());
                     }
-                } else {
-                    warn!(
-                        "Got selection notify from unexpected requestor: {:?}",
-                        e.requestor()
-                    );
                 }
             }
             xcb::Event::X(x::Event::SelectionRequest(e)) => {
                 let data = get_selection_data!(e.selection());
-                let send_notify = |property| {
-                    if let Err(e) = self.connection.send_and_check_request(&x::SendEvent {
-                        propagate: false,
-                        destination: x::SendEventDest::Window(e.requestor()),
-                        event_mask: x::EventMask::empty(),
-                        event: &x::SelectionNotifyEvent::new(
-                            e.time(),
-                            e.requestor(),
-                            e.selection(),
-                            e.target(),
-                            property,
-                        ),
-                    }) {
-                        warn!("Failed to send selection request notify: {e:?}");
-                    };
-                };
-                let refuse = || send_notify(x::ATOM_NONE);
-                let success = || send_notify(e.property());
-
+                let reply = SelectionReply::from_request(e);
                 if log::log_enabled!(log::Level::Debug) {
                     let target = get_atom_name(&self.connection, e.target());
                     let selection = get_atom_name(&self.connection, data.atom());
@@ -883,20 +999,36 @@ impl XState {
 
                 if e.property() == x::ATOM_NONE {
                     debug!("refusing - property is set to none");
-                    refuse();
+                    reply.notify(&self.connection, false);
                     return true;
                 }
 
-                if data.handle_selection_request(
+                let outcome = data.handle_selection_request(
                     &self.connection,
                     &self.atoms,
                     e,
                     self.max_req_bytes,
                     server_state,
-                ) {
-                    success()
-                } else {
-                    refuse()
+                );
+                match outcome {
+                    SelectionRequestOutcome::Immediate(success) => {
+                        reply.notify(&self.connection, success)
+                    }
+                    SelectionRequestOutcome::Pending(pending) => {
+                        // A property can represent only one transfer at a time.
+                        let duplicate = self.selection_state.pending_reads.iter().any(|p| {
+                            p.reply.requestor == reply.requestor
+                                && p.reply.property == reply.property
+                        }) || self.selection_state.incr_data.iter().any(|p| {
+                            p.reply.requestor == reply.requestor
+                                && p.reply.property == reply.property
+                        });
+                        if duplicate {
+                            reply.notify(&self.connection, false);
+                        } else {
+                            self.selection_state.pending_reads.push(pending);
+                        }
+                    }
                 }
             }
 
@@ -920,7 +1052,7 @@ impl XState {
                     xcb::xfixes::SelectionEvent::SelectionClientClose
                     | xcb::xfixes::SelectionEvent::SelectionWindowDestroy => {
                         debug!("Selection owner destroyed, selection will be unset");
-                        self.selection_state.clipboard.current_selection = None;
+                        get_selection_data!(x).selection_clear();
                     }
                 },
                 x if x == self.atoms.xsettings => match e.subtype() {
@@ -949,7 +1081,6 @@ impl XState {
         event: &x::PropertyNotifyEvent,
     ) -> bool {
         fn inner<T: SelectionType>(
-            connection: &xcb::Connection,
             event: &x::PropertyNotifyEvent,
             data: &mut SelectionData<T>,
         ) -> bool {
@@ -959,15 +1090,21 @@ impl XState {
                         return selection.check_for_incr(event);
                     }
                 }
-                x::Property::Delete => {
-                    if let Some(selection) = data.wayland_selection_mut() {
-                        return selection.check_for_incr(event, connection);
-                    }
-                }
+                x::Property::Delete => {}
             }
             false
         }
-        inner(&self.connection, event, &mut self.selection_state.primary)
-            || inner(&self.connection, event, &mut self.selection_state.clipboard)
+        if event.state() == x::Property::Delete {
+            if let Some(index) = self.selection_state.incr_data.iter().position(|p| {
+                p.reply.requestor == event.window() && p.reply.property == event.atom()
+            }) {
+                if self.selection_state.incr_data[index].advance(&self.connection) {
+                    self.selection_state.incr_data.remove(index);
+                }
+                return true;
+            }
+        }
+        inner(event, &mut self.selection_state.primary)
+            || inner(event, &mut self.selection_state.clipboard)
     }
 }

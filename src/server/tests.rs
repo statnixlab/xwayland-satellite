@@ -4,7 +4,7 @@ use crate::xstate::{SetState, WinSize, WmName};
 use crate::{XConnection, timespec_from_millis};
 use rustix::event::{PollFd, PollFlags, poll};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -1629,7 +1629,13 @@ fn copy_from_wayland<T: SelectionTest>() {
                     f.testwl.dispatch();
                 }
             });
-            selection.receive(mime.mime_type.clone(), &f.satellite)
+            {
+                let mut pipe = selection.receive(mime.mime_type.clone()).unwrap();
+                f.satellite.queue.flush().unwrap();
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).unwrap();
+                data
+            }
         });
         f.run();
         assert_eq!(data, mime.data);
@@ -1690,7 +1696,13 @@ fn selection_x11_then_wayland<T: SelectionTest>() {
                     f.testwl.dispatch();
                 }
             });
-            selection.receive(mime.mime_type.clone(), &f.satellite)
+            {
+                let mut pipe = selection.receive(mime.mime_type.clone()).unwrap();
+                f.satellite.queue.flush().unwrap();
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).unwrap();
+                data
+            }
         });
         f.run();
         assert_eq!(data, mime.data);

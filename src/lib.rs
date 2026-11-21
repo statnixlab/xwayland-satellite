@@ -1,4 +1,5 @@
 mod server;
+mod transfer;
 pub mod xstate;
 
 use crate::server::{NoConnection, PendingSurfaceState, ServerState};
@@ -247,12 +248,19 @@ pub fn main(mut data: impl RunData) -> Option<()> {
             xstate.update_global_scale(scale);
         }
 
+        xstate.advance_selection_transfers();
+
         // Synchronous X11 replies can buffer events without leaving the socket readable.
         if xstate.handle_events(&mut server_state) {
             continue;
         }
 
-        match poll(&mut fds, None) {
+        // Only wake periodically while a clipboard transfer is in flight. Every
+        // pipe is nonblocking and bounded per pass, so input/frames keep flowing.
+        let transfer_timeout = xstate
+            .has_pending_selection_transfers()
+            .then(|| timespec_from_millis(20));
+        match poll(&mut fds, transfer_timeout.as_ref()) {
             Ok(_) => {
                 if !fds[3].revents().is_empty() {
                     let status = xwayland_exit_code(&mut quit_rx);

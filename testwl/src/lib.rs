@@ -289,6 +289,8 @@ struct State {
     xdg_activation: Option<XdgActivationV1>,
     valid_tokens: HashSet<String>,
     token_counter: u32,
+    hold_selection_receives: bool,
+    held_selection_receives: Vec<(String, OwnedFd)>,
 }
 
 impl Default for State {
@@ -321,6 +323,8 @@ impl Default for State {
             xdg_activation: None,
             valid_tokens: HashSet::new(),
             token_counter: 0,
+            hold_selection_receives: false,
+            held_selection_receives: Vec::new(),
         }
     }
 }
@@ -789,11 +793,40 @@ impl Server {
         ret
     }
 
+    /// Start one paste without reading it, for backpressure and timeout tests.
+    pub fn begin_selection_paste(&mut self, primary: bool, mime: &str) -> OwnedFd {
+        let (rx, tx) = rustix::pipe::pipe().unwrap();
+        if primary {
+            self.state
+                .primary
+                .as_ref()
+                .expect("no primary source")
+                .send(mime.to_owned(), tx.as_fd());
+        } else {
+            self.state
+                .clipboard
+                .as_ref()
+                .expect("no clipboard source")
+                .send(mime.to_owned(), tx.as_fd());
+        }
+        self.display.flush_clients().unwrap();
+        rx
+    }
+
     pub fn data_source_exists(&self) -> bool {
         self.state.clipboard.is_none()
     }
 
     #[track_caller]
+    /// Let tests model an owner that delays, partially writes, or never closes.
+    pub fn hold_selection_receives(&mut self, hold: bool) {
+        self.state.hold_selection_receives = hold;
+    }
+
+    pub fn take_selection_receives(&mut self) -> Vec<(String, OwnedFd)> {
+        std::mem::take(&mut self.state.held_selection_receives)
+    }
+
     pub fn create_data_offer(&mut self, data: Vec<PasteData>) {
         let Some(dev) = &self.state.data_device else {
             panic!("No data device created");
@@ -1221,7 +1254,7 @@ impl Dispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for State {
 
 impl Dispatch<ZwpPrimarySelectionOfferV1, Vec<PasteData>> for State {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         _: &ZwpPrimarySelectionOfferV1,
         request: <ZwpPrimarySelectionOfferV1 as Resource>::Request,
@@ -1232,6 +1265,10 @@ impl Dispatch<ZwpPrimarySelectionOfferV1, Vec<PasteData>> for State {
         use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_offer_v1::Request;
         match request {
             Request::Receive { mime_type, fd } => {
+                if state.hold_selection_receives {
+                    state.held_selection_receives.push((mime_type, fd));
+                    return;
+                }
                 let pos = data
                     .iter()
                     .position(|data| data.mime_type == mime_type)
@@ -1306,7 +1343,7 @@ impl GlobalDispatch<WlDataDeviceManager, ()> for State {
 
 impl Dispatch<WlDataOffer, Vec<PasteData>> for State {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         _: &WlDataOffer,
         request: <WlDataOffer as Resource>::Request,
@@ -1316,6 +1353,10 @@ impl Dispatch<WlDataOffer, Vec<PasteData>> for State {
     ) {
         match request {
             wl_data_offer::Request::Receive { mime_type, fd } => {
+                if state.hold_selection_receives {
+                    state.held_selection_receives.push((mime_type, fd));
+                    return;
+                }
                 let pos = data
                     .iter()
                     .position(|data| data.mime_type == mime_type)
