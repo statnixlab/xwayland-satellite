@@ -8,6 +8,7 @@ desktop (CachyOS, NVIDIA, niri at 200% scale).
 | Name | Meaning |
 | --- | --- |
 | `official` | https://github.com/Supreeeme/xwayland-satellite.git (upstream) |
+| `origin` | https://github.com/statnixlab/xwayland-satellite.git (personal fork; push here) |
 | `machine/nvidia-desktop` | Personal patches; what the installed binaries are built from |
 | `review/official-YYYYMMDD` | A rebase onto newer upstream, built and tested before adoption |
 
@@ -51,3 +52,5 @@ only the affected service. Restarting `xwayland-chat.service` disconnects QQ:
 quit it first. When satisfied, move `machine/nvidia-desktop` to the review branch
 (`git branch -f machine/nvidia-desktop review/...`), keeping the old tip as a tag
 `archive/nvidia-desktop-YYYYMMDD`.
+Push the archive tag first, then the branch with `--force-with-lease`, then
+update `desktop-config/system-reference/xwayland-satellite/source.json`.
