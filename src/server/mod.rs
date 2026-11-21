@@ -1220,6 +1220,25 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.last_focused_toplevel.unwrap_or(x::WINDOW_NONE)
     }
 
+    pub fn minimize_window(&mut self, window: x::Window) {
+        let Some(data) = self
+            .windows
+            .get(&window)
+            .copied()
+            .and_then(|id| self.world.entity(id).ok())
+        else {
+            return;
+        };
+        let Some(role) = data.get::<&SurfaceRole>() else {
+            return;
+        };
+        if let SurfaceRole::Toplevel(Some(toplevel)) = &*role {
+            // Let the compositor own visibility and restoration. Do not unmap
+            // the X window or claim an iconic state before it accepts the request.
+            toplevel.toplevel.set_minimized();
+        }
+    }
+
     pub fn set_maximized(&mut self, window: x::Window, state: super::xstate::SetState) {
         let Some(data) = self
             .windows

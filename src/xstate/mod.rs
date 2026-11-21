@@ -548,6 +548,15 @@ impl XState {
                 };
                 server_state.set_window_serial(e.window(), [data[0], data[1]]);
             }
+            x if x == self.atoms.wm_change_state => {
+                // ICCCM clients (including Electron and Qt on X11) request
+                // minimization with a 32-bit WM_CHANGE_STATE/IconicState.
+                if let x::ClientMessageData::Data32(data) = e.data() {
+                    if data[0] == WmState::Iconic as u32 {
+                        server_state.minimize_window(e.window());
+                    }
+                }
+            }
             x if x == self.atoms.net_wm_state => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
                     unreachable!();
@@ -915,6 +924,7 @@ xcb::atoms_struct! {
         wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
         wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
         wm_state => b"WM_STATE" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         wm_s0 => b"WM_S0" only_if_exists = false,
         net_wm_cm_s0 => b"_NET_WM_CM_S0" only_if_exists = false,
         wm_check => b"_NET_SUPPORTING_WM_CHECK" only_if_exists = false,
