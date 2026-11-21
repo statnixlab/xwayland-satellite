@@ -653,6 +653,7 @@ impl XState {
         if title.is_none() {
             title = self.get_wm_name(window)?;
         }
+        let wm_name = title.as_ref().map(|title| title.name().to_owned());
         if let Some(name) = title {
             server_state.set_win_title(window, name);
         }
@@ -695,6 +696,7 @@ impl XState {
             window_types,
             motif_wm_hints,
             wm_class,
+            wm_name,
             wm_normal_hints: size_hints,
         };
         let role = heuristics.guess_window_role(&self.window_atoms);
@@ -962,6 +964,7 @@ xcb::atoms_struct! {
     struct WindowTypes {
         ty => b"_NET_WM_WINDOW_TYPE" only_if_exists = false,
         normal => b"_NET_WM_WINDOW_TYPE_NORMAL" only_if_exists = false,
+        kde_override => b"_KDE_NET_WM_WINDOW_TYPE_OVERRIDE" only_if_exists = false,
         dialog => b"_NET_WM_WINDOW_TYPE_DIALOG" only_if_exists = false,
         drag_n_drop => b"_NET_WM_WINDOW_TYPE_DND" only_if_exists = false,
         splash => b"_NET_WM_WINDOW_TYPE_SPLASH" only_if_exists = false,
@@ -1182,6 +1185,7 @@ struct WindowRoleHeuristics {
     window_types: Vec<x::Atom>,
     motif_wm_hints: Option<motif::Hints>,
     wm_class: Option<String>,
+    wm_name: Option<String>,
     wm_normal_hints: Option<WmNormalHints>,
 }
 impl WindowRoleHeuristics {
@@ -1213,6 +1217,26 @@ impl WindowRoleHeuristics {
                 .zip(hints.max_size)
                 .is_some_and(|(min, max)| min == max)
         });
+
+        // WPS Writer/Spreadsheets 12's selection toolbar is a fixed-size, borderless tool
+        // window, but Qt advertises it as KDE_OVERRIDE + NORMAL without a
+        // transient parent. A toplevel loses its requested position and WPS
+        // immediately dismisses it when the pointer moves. Keep this narrow:
+        // titled dialogs, resizable documents and other applications stay
+        // toplevels. Normal popup parenting/positioning handles the toolbar.
+        let is_wps_selection_toolbar = matches!(
+            (self.wm_class.as_deref(), self.wm_name.as_deref()),
+            (Some("wps"), Some("wps")) | (Some("et"), Some("et"))
+        );
+        if is_wps_selection_toolbar
+            && !self.has_transient_for
+            && motif_no_decor
+            && forced_size
+            && self.window_types.contains(&window_atoms.kde_override)
+            && self.window_types.contains(&window_atoms.normal)
+        {
+            return WindowRole::Popup;
+        }
 
         let mut window_types = self.window_types.clone();
         if self.window_types.is_empty() {
