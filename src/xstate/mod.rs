@@ -111,9 +111,14 @@ pub struct XState {
     selection_state: SelectionState,
     settings: Settings,
     max_req_bytes: usize,
+    file_clipboard_executable: Option<std::path::PathBuf>,
 }
 
 impl XState {
+    pub(crate) fn set_file_clipboard_executable(&mut self, executable: Option<std::path::PathBuf>) {
+        self.file_clipboard_executable = executable.filter(|path| path.is_absolute());
+    }
+
     pub fn new(fd: BorrowedFd) -> Self {
         let connection = Rc::new(
             xcb::Connection::connect_with_fd_and_extensions(
@@ -231,6 +236,7 @@ impl XState {
             selection_state,
             settings,
             max_req_bytes,
+            file_clipboard_executable: None,
         };
         r.create_ewmh_window();
         r.set_xsettings_owner();
