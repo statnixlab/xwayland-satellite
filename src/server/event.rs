@@ -394,8 +394,12 @@ impl SurfaceEvents {
                         })
                     };
                     toplevel.fullscreen = has_state(xdg_toplevel::State::Fullscreen);
-                    toplevel.maximized = has_state(xdg_toplevel::State::Maximized);
-                    if (toplevel.fullscreen, toplevel.maximized) != previous {
+                    toplevel.maximized = toplevel
+                        .column_maximized
+                        .unwrap_or_else(|| has_state(xdg_toplevel::State::Maximized));
+                    if (toplevel.fullscreen, toplevel.maximized) != previous
+                        || toplevel.column_maximized.is_some()
+                    {
                         state.connection.set_toplevel_state(
                             *data.get::<&x::Window>().unwrap(),
                             toplevel.fullscreen,
