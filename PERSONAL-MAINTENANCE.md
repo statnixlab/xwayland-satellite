@@ -24,6 +24,7 @@ desktop (CachyOS, NVIDIA, niri at 200% scale).
 | Forward ICCCM `WM_CHANGE_STATE`/IconicState as minimize | X11 minimize buttons (Electron, Qt) -> `set_minimized` |
 | Accept move/resize requests with an unspecified (0) button | QQ/Electron title bar dragging |
 | Make clipboard transfers nonblocking and bounded | Stalled selection owners no longer freeze windows (QQ) |
+| Follow the compositor when it ignores our X11 selection source | An ignored `set_selection` no longer blocks every later Wayland copy (WeChat paste stuck empty) |
 | Document the personal branch and update workflow | This file |
 
 Upstream's own fix for X11 events buffered during synchronous replies

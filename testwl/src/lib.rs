@@ -228,6 +228,14 @@ impl From<&WlSurface> for SurfaceId {
 #[derive(Hash, Clone, Copy, Eq, PartialEq)]
 struct PositionerId(u32);
 
+/// Prefix of the private mime type xwayland-satellite adds to its own sources to recognise them.
+/// Real paste clients never ask for it, so the helpers below leave it out.
+pub const SATELLITE_SOURCE_MARKER_PREFIX: &str = "application/x-xwayland-satellite-source";
+
+fn is_satellite_marker(mime: &str) -> bool {
+    mime.starts_with(SATELLITE_SOURCE_MARKER_PREFIX)
+}
+
 #[derive(Default)]
 struct DataSourceData {
     mimes: Vec<String>,
@@ -677,6 +685,15 @@ impl Server {
 
     #[track_caller]
     pub fn data_source_mimes(&self) -> Vec<String> {
+        self.data_source_mimes_with_marker()
+            .into_iter()
+            .filter(|mime| !is_satellite_marker(mime))
+            .collect()
+    }
+
+    /// Like [`Self::data_source_mimes`], including xwayland-satellite's own-source marker.
+    #[track_caller]
+    pub fn data_source_mimes_with_marker(&self) -> Vec<String> {
         let Some(selection) = &self.state.clipboard else {
             panic!("No selection set on data device");
         };
@@ -688,6 +705,15 @@ impl Server {
 
     #[track_caller]
     pub fn primary_source_mimes(&self) -> Vec<String> {
+        self.primary_source_mimes_with_marker()
+            .into_iter()
+            .filter(|mime| !is_satellite_marker(mime))
+            .collect()
+    }
+
+    /// Like [`Self::primary_source_mimes`], including xwayland-satellite's own-source marker.
+    #[track_caller]
+    pub fn primary_source_mimes_with_marker(&self) -> Vec<String> {
         let Some(selection) = &self.state.primary else {
             panic!("No selection set on primary device");
         };
@@ -695,6 +721,17 @@ impl Server {
         let data: &Mutex<DataSourceData> = selection.data().unwrap();
         let data = data.lock().unwrap();
         data.mimes.to_vec()
+    }
+
+    /// Drop the current clipboard source without telling its owner, like a compositor that
+    /// ignores a set_selection request it does not accept.
+    pub fn forget_clipboard_source(&mut self) {
+        self.state.clipboard = None;
+    }
+
+    /// Primary-selection counterpart of [`Self::forget_clipboard_source`].
+    pub fn forget_primary_source(&mut self) {
+        self.state.primary = None;
     }
 
     fn paste_impl(
@@ -714,6 +751,7 @@ impl Server {
                 .mimes
                 .iter()
                 .rev()
+                .filter(|mime| !is_satellite_marker(mime))
                 .map(|mime| (mime.clone(), None))
                 .collect()
         };

@@ -1,5 +1,5 @@
 use super::{InnerServerState, NoConnection, ServerState, WindowDims, selection::Clipboard};
-use crate::server::selection::{Primary, SelectionType};
+use crate::server::selection::{Primary, SelectionType, own_source_marker};
 use crate::xstate::{SetState, WinSize, WmName};
 use crate::{XConnection, timespec_from_millis};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -1500,19 +1500,24 @@ fn splash_window_fixed_size() {
 trait SelectionTest {
     type SelectionType: SelectionType;
     fn mimes(testwl: &mut testwl::Server) -> Vec<String>;
+    fn mimes_with_marker(testwl: &mut testwl::Server) -> Vec<String>;
     fn paste_data(
         testwl: &mut testwl::Server,
         send_data: impl SendDataForMimeFn,
     ) -> Vec<testwl::PasteData>;
     fn create_offer(testwl: &mut testwl::Server, data: Vec<testwl::PasteData>);
+    fn forget_source(testwl: &mut testwl::Server);
 }
 
 macro_rules! selection_tests {
-    ($name:ident, $selection_type:ty, $get_mime_fn:ident, $get_paste_data_fn:ident, $create_offer_fn:ident) => {
+    ($name:ident, $selection_type:ty, $get_mime_fn:ident, $get_mime_with_marker_fn:ident, $get_paste_data_fn:ident, $create_offer_fn:ident, $forget_source_fn:ident) => {
         impl SelectionTest for $selection_type {
             type SelectionType = $selection_type;
             fn mimes(testwl: &mut testwl::Server) -> Vec<String> {
                 testwl.$get_mime_fn()
+            }
+            fn mimes_with_marker(testwl: &mut testwl::Server) -> Vec<String> {
+                testwl.$get_mime_with_marker_fn()
             }
             fn paste_data(
                 testwl: &mut testwl::Server,
@@ -1522,6 +1527,9 @@ macro_rules! selection_tests {
             }
             fn create_offer(testwl: &mut testwl::Server, data: Vec<testwl::PasteData>) {
                 testwl.$create_offer_fn(data);
+            }
+            fn forget_source(testwl: &mut testwl::Server) {
+                testwl.$forget_source_fn();
             }
         }
 
@@ -1541,6 +1549,16 @@ macro_rules! selection_tests {
             fn x11_then_wayland() {
                 super::selection_x11_then_wayland::<$selection_type>();
             }
+
+            #[test]
+            fn wayland_after_ignored_x11_source() {
+                super::selection_wayland_after_ignored_x11_source::<$selection_type>();
+            }
+
+            #[test]
+            fn own_source_echo_is_not_foreign() {
+                super::selection_own_source_echo_is_not_foreign::<$selection_type>();
+            }
         }
     };
 }
@@ -1549,15 +1567,19 @@ selection_tests!(
     clipboard,
     Clipboard,
     data_source_mimes,
+    data_source_mimes_with_marker,
     clipboard_paste_data,
-    create_data_offer
+    create_data_offer,
+    forget_clipboard_source
 );
 selection_tests!(
     primary,
     Primary,
     primary_source_mimes,
+    primary_source_mimes_with_marker,
     primary_paste_data,
-    create_primary_offer
+    create_primary_offer,
+    forget_primary_source
 );
 
 fn copy_from_x11<T: SelectionTest>() {
@@ -1640,6 +1662,73 @@ fn copy_from_wayland<T: SelectionTest>() {
         f.run();
         assert_eq!(data, mime.data);
     }
+}
+
+/// The compositor may ignore our set_selection without cancelling the source. A later Wayland
+/// selection must still reach X11 instead of being shadowed by the ignored X11 source.
+fn selection_wayland_after_ignored_x11_source<T: SelectionTest>() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let win = Window::new(1);
+    let (_surface, _id) = f.create_toplevel(&comp, win);
+
+    let x11data = std::rc::Rc::new(vec![testwl::PasteData {
+        mime_type: "text".to_string(),
+        data: b"abc".to_vec(),
+    }]);
+    f.satellite
+        .set_selection_source::<T::SelectionType>(&x11data);
+    f.run();
+    assert!(T::mimes_with_marker(&mut f.testwl).contains(&own_source_marker().to_string()));
+    T::forget_source(&mut f.testwl);
+
+    let waylanddata = vec![testwl::PasteData {
+        mime_type: "asdf".to_string(),
+        data: b"fdaa".to_vec(),
+    }];
+    T::create_offer(&mut f.testwl, waylanddata.clone());
+    f.run();
+    f.run();
+
+    let selection = f
+        .satellite
+        .new_selection::<T::SelectionType>()
+        .expect("Wayland selection was shadowed by an ignored X11 source");
+    assert_eq!(&*selection.mime_types, ["asdf".to_string()]);
+}
+
+/// The compositor echoes our own source back as an offer; it must not be treated as a new
+/// foreign selection, which would take X11 ownership away from the real X11 owner.
+fn selection_own_source_echo_is_not_foreign<T: SelectionTest>() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let win = Window::new(1);
+    let (_surface, _id) = f.create_toplevel(&comp, win);
+
+    let x11data = std::rc::Rc::new(vec![testwl::PasteData {
+        mime_type: "text".to_string(),
+        data: b"abc".to_vec(),
+    }]);
+    f.satellite
+        .set_selection_source::<T::SelectionType>(&x11data);
+    f.run();
+    let echoed: Vec<_> = T::mimes_with_marker(&mut f.testwl)
+        .into_iter()
+        .map(|mime_type| testwl::PasteData {
+            mime_type,
+            data: Vec::new(),
+        })
+        .collect();
+    // Re-announce without cancelling, as on a keyboard focus change.
+    T::forget_source(&mut f.testwl);
+    T::create_offer(&mut f.testwl, echoed);
+    f.run();
+    f.run();
+
+    assert!(
+        f.satellite.new_selection::<T::SelectionType>().is_none(),
+        "Our own source was treated as a foreign selection"
+    );
 }
 
 fn selection_x11_then_wayland<T: SelectionTest>() {
