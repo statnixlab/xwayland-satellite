@@ -463,7 +463,10 @@ impl<T: SelectionType> SelectionDataImpl for SelectionData<T> {
         if let Err(e) = connection.send_and_check_request(&x::SetSelectionOwner {
             owner: wm_window,
             selection: self.atom,
-            time: self.last_selection_timestamp,
+            // A Wayland selection is newer than every X11 one. Reusing the
+            // last X11 owner's timestamp makes clients such as Qt keep their
+            // cached TARGETS, so they keep pasting the old X11 data.
+            time: x::CURRENT_TIME,
         }) {
             warn!(
                 "Could not become owner of {}: {e:?}",

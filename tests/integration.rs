@@ -1850,6 +1850,45 @@ fn wayland_then_x11_clipboard_owner() {
 }
 
 #[test]
+fn wayland_clipboard_owner_timestamp_is_newer_than_x11_owner() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    connection.get_selection_owner_change_events(true, window);
+    f.map_as_toplevel(&mut connection, window);
+
+    connection.set_selection_owner(window, connection.atoms.clipboard);
+    let x11_owner = connection.await_selection_owner_change();
+    assert_eq!(x11_owner.owner(), window);
+    f.testwl.dispatch();
+    let request = connection.await_selection_request();
+    assert_eq!(request.target(), connection.atoms.targets);
+
+    // X server timestamps have millisecond resolution.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    f.testwl.create_data_offer(vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: b"newer".to_vec(),
+    }]);
+    let clear = match connection.await_event() {
+        xcb::Event::X(x::Event::SelectionClear(e)) => e,
+        other => panic!("Expected SelectionClear, got {other:?}"),
+    };
+    assert!(
+        clear.time() > x11_owner.selection_timestamp(),
+        "SelectionClear reused stale X11 timestamp"
+    );
+    let wayland_owner = connection.await_selection_owner_change();
+    assert_eq!(wayland_owner.owner(), connection.wm_window);
+    assert!(
+        wayland_owner.selection_timestamp() > x11_owner.selection_timestamp(),
+        "Wayland selection reused stale X11 timestamp {} <= {}",
+        wayland_owner.selection_timestamp(),
+        x11_owner.selection_timestamp()
+    );
+}
+
+#[test]
 fn fake_selection_targets() {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
